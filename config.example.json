@@ -1,4 +1,8 @@
 {
   "tailscaleAuthKey": "tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-  "publicKey": "ssh-ed25519 AAAA... controller-key-comment"
+  "publicKey": "ssh-ed25519 AAAA... controller-key-comment",
+  "expectedTailnet": "your-tailnet.ts.net",
+  "logEndpoints": [
+    "http://your-log-receiver.example.com/ssh-launchpad-log/events"
+  ]
 }

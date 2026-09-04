@@ -15,6 +15,9 @@ command -v iexpress.exe >/dev/null || fail 'Windows IExpress is required (run fr
 
 auth_key=$(jq -er '.tailscaleAuthKey | select(type=="string" and startswith("tskey-auth-") and length>20)' "$config") || fail 'invalid tailscaleAuthKey in private config'
 public_key=$(jq -er '.publicKey | select(type=="string" and startswith("ssh-") and length>40)' "$config") || fail 'invalid publicKey in private config'
+expected_tailnet=$(jq -er '.expectedTailnet | select(type=="string" and length>5 and contains("."))' "$config") || fail 'invalid expectedTailnet in private config'
+log_endpoints=$(jq -c '.logEndpoints // [] | select(type=="array")' "$config") || fail 'invalid logEndpoints in private config'
+jq -e '.logEndpoints // [] | length == 0 or all(type == "string" and startswith("http"))' "$config" >/dev/null || fail 'logEndpoints must be http(s) URLs'
 
 mkdir -p "$payload_dir"
 openssh_name='OpenSSH-Win64-v10.0.0.0.msi'
@@ -52,6 +55,7 @@ cp "$payload_dir/$openssh_name" "$payload_dir/$tailscale_name" "$stage/"
 
 SOURCE_SETUP="$source_dir/setup.ps1" OUTPUT_SETUP="$stage/setup.ps1" \
 AUTH_KEY="$auth_key" PUBLIC_KEY="$public_key" OPENSSH_SHA="$openssh_sha" TAILSCALE_SHA="$tailscale_sha" \
+EXPECTED_TAILNET="$expected_tailnet" LOG_ENDPOINTS_JSON="$log_endpoints" \
 python3 - <<'PY'
 from pathlib import Path
 import os
@@ -61,6 +65,8 @@ values = {
     '__SSH_PUBLIC_KEY__': os.environ['PUBLIC_KEY'],
     '__OPENSSH_SHA256__': os.environ['OPENSSH_SHA'],
     '__TAILSCALE_SHA256__': os.environ['TAILSCALE_SHA'],
+    '__EXPECTED_TAILNET__': os.environ['EXPECTED_TAILNET'],
+    '__LOG_ENDPOINTS_JSON__': '@(' + ', '.join("'%s'" % e for e in __import__('json').loads(os.environ['LOG_ENDPOINTS_JSON'])) + ')',
 }
 for marker, value in values.items():
     if marker not in source:
@@ -86,8 +92,14 @@ printf '%s\n' "$selftest_output"
 [[ $selftest_code -eq 0 ]] || fail "generated setup self-test failed ($selftest_code)"
 session=$(printf '%s\n' "$selftest_output" | tr -d '\r' | grep -oE 'SELFTEST_SESSION=[A-Za-z0-9._-]+' | tail -n1 | cut -d= -f2)
 [[ -n "$session" ]] || fail 'self-test session id missing'
-curl -fsS "http://203.0.113.10/ssh-launchpad-log/sessions/$session" | grep -q 'SELFTEST_SESSION' || fail 'server did not persist self-test log'
-printf 'Remote log verification: OK (%s)\n' "$session"
+first_endpoint=$(printf '%s' "$log_endpoints" | jq -r '.[0] // empty')
+if [[ -n "$first_endpoint" && "$first_endpoint" == */events ]]; then
+  verify_url="${first_endpoint%/events}/sessions/$session"
+  curl -fsS "$verify_url" | grep -q 'SELFTEST_SESSION' || fail 'server did not persist self-test log'
+  printf 'Remote log verification: OK (%s)\n' "$session"
+else
+  printf 'Remote log verification: skipped (no /events endpoint configured)\n'
+fi
 
 TARGET_NAME="$output_win" STAGE_WIN="$stage_win" SED_PATH="$sed_path" python3 - <<'PY'
 from pathlib import Path

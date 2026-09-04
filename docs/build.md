@@ -76,9 +76,9 @@ the Windows desktop.
 4. Recreate the TCP 22 Windows Firewall rule with remote addresses restricted
    to the Tailscale IPv4 range `100.64.0.0/10`.
 5. Install/reuse Tailscale.
-6. Reuse an already-running session only when it belongs to
-   `tailnet.example.ts.net`; otherwise force reauthentication with the embedded
-   one-time key.
+6. Reuse an already-running session only when it belongs to the expected
+   Tailnet configured via `expectedTailnet`; otherwise force reauthentication
+   with the embedded one-time key.
 7. Verify sshd, TCP 22, key presence, the expected Tailnet identity, Tailscale
    state, and Tailscale IPv4.
 
@@ -100,32 +100,28 @@ Desktop\SSH-安装日志.log
 Desktop\SSH-连接信息.txt
 ```
 
-Every event is uploaded immediately. If both endpoints are unavailable, events
-are queued locally and retried without blocking installation:
+Every event is uploaded immediately to the endpoints configured in
+`logEndpoints`. If no endpoint is configured, remote logging is skipped; if all
+currently configured endpoints are unavailable, events are queued locally and
+retried without blocking installation.
 
-```text
-http://203.0.113.10/ssh-launchpad-log/
-https://log-receiver.example.com/ssh-launchpad-log/
-```
-
-The first URL is the direct Aliyun path; the second is the Cloudflare-backed
-fallback. The dashboard refreshes session data every two seconds.
+The first URL is the direct path; the second is the Cloudflare-backed fallback.
+The dashboard refreshes session data every two seconds.
 
 ## Log receiver
 
 Source: `log-receiver/`
 
-Deployment on `Prism-Zero`:
+Example deployment on any Linux host with Docker:
 
 ```text
 /opt/ssh-launchpad-log/
 container: ssh-launchpad-log
-network: pulse-tracker_default
-Caddy route: /ssh-launchpad-log/*
-data: /opt/ssh-launchpad-log/data/*.jsonl
+reverse-proxy route: /ssh-launchpad-log/* -> container
+persisted data: /opt/ssh-launchpad-log/data/*.jsonl
 ```
 
 The receiver is a statically linked Go service with bounded request bodies,
 strict event decoding, append-and-sync persistence, health/session endpoints,
-and a small live browser view. Caddy configuration was backed up before adding
-the route.
+and a small live browser view. Back up your reverse-proxy configuration before
+adding the route.

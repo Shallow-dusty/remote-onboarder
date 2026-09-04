@@ -15,17 +15,14 @@ $ToolVersion = '1.0.0'
 $SshPort = 22
 $TailscaleRemoteAddress = '100.64.0.0/10'
 $TailscaleRemoteAddressNormalized = '100.64.0.0/255.192.0.0'
-$ExpectedTailnet = 'tailnet.example.ts.net'
+$ExpectedTailnet = '__EXPECTED_TAILNET__'
 $PublicKey = '__SSH_PUBLIC_KEY__'
 $TailscaleAuthKey = '__TAILSCALE_AUTH_KEY__'
 $OpenSshPayloadName = 'OpenSSH-Win64-v10.0.0.0.msi'
 $OpenSshPayloadSHA256 = '__OPENSSH_SHA256__'
 $TailscalePayloadName = 'tailscale-setup-1.102.3-amd64.msi'
 $TailscalePayloadSHA256 = '__TAILSCALE_SHA256__'
-$LogEndpoints = @(
-    'http://203.0.113.10/ssh-launchpad-log/events',
-    'https://log-receiver.example.com/ssh-launchpad-log/events'
-)
+$LogEndpoints = __LOG_ENDPOINTS_JSON__
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:Sequence = 0
@@ -561,7 +558,7 @@ function Invoke-SelfTest {
     if ((Get-OpenSshInstallDecision $false $false) -ne 'install') { throw '自检失败：缺少服务时应选择全新安装' }
     if ((Get-OpenSshInstallDecision $true $false) -ne 'repair') { throw '自检失败：服务在但 sshd.exe 缺失时应选择修复重装' }
     if ((Get-OpenSshInstallDecision $true $true) -ne 'skip') { throw '自检失败：服务与程序齐全时应跳过安装' }
-    $fakeTailnet = '{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"tailnet.example.ts.net"}}' | ConvertFrom-Json
+    $fakeTailnet = ('{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"' + $ExpectedTailnet + '"}}') | ConvertFrom-Json
     if ((Get-TailnetIdentity $fakeTailnet) -ne $ExpectedTailnet) { throw '目标 Tailnet 识别自检失败' }
 
     $keyPath = Join-Path $StateRoot '.ssh\authorized_keys'
@@ -580,8 +577,12 @@ function Invoke-SelfTest {
         -Arguments '/d /c echo native-process-ok' -DisplayName '原生命令包装器自检' -TimeoutSeconds 10)
     Flush-UploadQueue -Force
     Write-SetupEvent OK ("SELFTEST_SESSION=$($script:SessionId)")
-    if (-not $script:ActiveEndpoint) { throw '日志上传端点均不可达' }
-    Write-SetupEvent OK ("实时日志已上传到：$($script:ActiveEndpoint)")
+    if ($LogEndpoints.Count -gt 0) {
+        if (-not $script:ActiveEndpoint) { throw '日志上传端点均不可达' }
+        Write-SetupEvent OK ("实时日志已上传到：$($script:ActiveEndpoint)")
+    } else {
+        Write-SetupEvent OK '未配置远程日志端点，跳过远程上传自检'
+    }
 }
 
 try {
