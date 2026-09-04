@@ -43,7 +43,11 @@ The private build input is intentionally under the ignored `build/` tree:
 ```json
 {
   "tailscaleAuthKey": "tskey-auth-...",
-  "publicKey": "ssh-ed25519 AAAA... controller"
+  "publicKey": "ssh-ed25519 AAAA... controller",
+  "expectedTailnet": "your-tailnet.ts.net",
+  "logEndpoints": [
+    "http://your-log-receiver.example.com/ssh-launchpad-log/events"
+  ]
 }
 ```
 
@@ -54,12 +58,13 @@ from WSL:
 ./scripts/build-oneclick-windows.sh
 ```
 
-The builder downloads missing pinned payloads, injects the private build input,
-parses the generated script with Windows PowerShell 5.1, validates both vendor
-signatures, executes the non-mutating self-test, verifies that its structured
-logs reached the remote receiver, builds the IExpress SFX, extracts the SFX
-without executing it, compares every embedded file, and places the result on
-the Windows desktop.
+The builder downloads missing pinned payloads, injects the private build input
+(tailnet identity and log endpoints included), parses the generated script with
+Windows PowerShell 5.1, validates both vendor signatures, executes the
+non-mutating self-test, verifies that its structured logs reached the remote
+receiver when a `/events` endpoint is configured, builds the IExpress SFX,
+extracts the SFX without executing it, compares every embedded file, and
+places the result on the Windows desktop.
 
 ## Runtime steps
 

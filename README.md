@@ -36,6 +36,7 @@ scripts/
   build-oneclick-windows.sh   WSL 构建脚本：下载固定版 MSI → 注入私密配置 →
                               语法/签名/自检/解包比对 → IExpress 打包 → 桌面
 docs/build.md            构建流程、运行时步骤、日志与服务器部署细节
+AGENTS.md                仓库工作约定（安全契约与开发规范）
 config.example.json      私密配置样例（真实配置放 build/oneclick/private-config.json，
                          0600 权限，永远不进 git）
 ```
