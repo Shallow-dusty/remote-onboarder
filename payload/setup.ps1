@@ -13,6 +13,8 @@ $ProgressPreference = 'SilentlyContinue'
 
 $ToolVersion = '1.0.0'
 $SshPort = 22
+$TailscaleRemoteAddress = '100.64.0.0/10'
+$TailscaleRemoteAddressNormalized = '100.64.0.0/255.192.0.0'
 $ExpectedTailnet = 'tailnet.example.ts.net'
 $PublicKey = '__SSH_PUBLIC_KEY__'
 $TailscaleAuthKey = '__TAILSCALE_AUTH_KEY__'
@@ -254,6 +256,8 @@ function Get-ManagedSshConfig([string]$Existing) {
         '# BEGIN SSH-LAUNCHPAD-ONECLICK',
         ('Port {0}' -f $SshPort),
         'PubkeyAuthentication yes',
+        'PasswordAuthentication no',
+        'KbdInteractiveAuthentication no',
         'AuthorizedKeysFile .ssh/authorized_keys',
         '# END SSH-LAUNCHPAD-ONECLICK',
         ''
@@ -410,22 +414,11 @@ function Configure-OpenSSH {
 function Configure-Firewall {
     Set-Step 'firewall' '第 4/7 步：配置 Windows 防火墙'
     $ruleName = 'SSH-Launchpad-OneClick-22'
-    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-    if ($rule) {
-        $port = $rule | Get-NetFirewallPortFilter
-        if ($port.Protocol -ne 'TCP' -or [string]$port.LocalPort -ne [string]$SshPort) {
-            $rule | Remove-NetFirewallRule
-            $rule = $null
-        }
-    }
-    if (-not $rule) {
-        New-NetFirewallRule -Name $ruleName -DisplayName 'SSH Launchpad OneClick (TCP 22)' `
-            -Enabled True -Direction Inbound -Protocol TCP -LocalPort $SshPort `
-            -Action Allow -Profile Any | Out-Null
-    } else {
-        $rule | Set-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -Profile Any | Out-Null
-    }
-    Write-SetupEvent OK 'TCP 22 入站规则已启用'
+    Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    New-NetFirewallRule -Name $ruleName -DisplayName 'SSH Launchpad OneClick (TCP 22, Tailscale only)' `
+        -Enabled True -Direction Inbound -Protocol TCP -LocalPort $SshPort `
+        -RemoteAddress $TailscaleRemoteAddress -Action Allow -Profile Any | Out-Null
+    Write-SetupEvent OK ("TCP 22 仅允许 Tailscale 地址范围：$TailscaleRemoteAddress")
 }
 
 function Install-Tailscale([string]$MsiPath) {
@@ -501,7 +494,17 @@ function Verify-Result([string]$TailscaleIP) {
     }
     $userKeys = Join-Path $TargetProfile '.ssh\authorized_keys'
     if (-not (Select-String -LiteralPath $userKeys -SimpleMatch $PublicKey -Quiet)) { throw '最终检查发现目标用户公钥缺失' }
-    Write-SetupEvent OK 'sshd 正在监听、公钥存在、Tailscale 在线'
+    $firewallRule = Get-NetFirewallRule -Name 'SSH-Launchpad-OneClick-22' -ErrorAction SilentlyContinue
+    $firewallPort = $firewallRule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+    $firewallAddress = $firewallRule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+    $firewallRemoteAddresses = @($firewallAddress.RemoteAddress)
+    $firewallScopeValid = $firewallRemoteAddresses.Count -eq 1 -and
+        $firewallRemoteAddresses[0] -in @($TailscaleRemoteAddress, $TailscaleRemoteAddressNormalized)
+    if (-not $firewallRule -or [string]$firewallPort.Protocol -ne 'TCP' -or
+        [string]$firewallPort.LocalPort -ne [string]$SshPort -or -not $firewallScopeValid) {
+        throw "最终检查发现 TCP $SshPort 防火墙规则未限制到 $TailscaleRemoteAddress"
+    }
+    Write-SetupEvent OK 'sshd 正在监听、公钥存在、防火墙仅限 Tailscale、Tailscale 在线'
 
     $sshCommand = 'ssh {0}@{1}' -f $TargetUser, $TailscaleIP
     $result = @(
@@ -538,6 +541,9 @@ function Invoke-SelfTest {
     $rendered = Get-ManagedSshConfig $sample
     if (($rendered -split '# BEGIN SSH-LAUNCHPAD-ONECLICK').Count -ne 2) { throw '托管配置块未保持单例' }
     if ($rendered.IndexOf('# BEGIN SSH-LAUNCHPAD-ONECLICK') -gt $rendered.IndexOf('Match Group')) { throw '托管配置块未位于 Match 之前' }
+    if ($rendered -notmatch '(?m)^PasswordAuthentication no\r?$') { throw '未关闭 SSH 密码认证' }
+    if ($rendered -notmatch '(?m)^KbdInteractiveAuthentication no\r?$') { throw '未关闭 SSH 键盘交互认证' }
+    if ($TailscaleRemoteAddress -ne '100.64.0.0/10') { throw 'Tailscale 防火墙范围自检失败' }
     $fakeTailnet = '{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"tailnet.example.ts.net"}}' | ConvertFrom-Json
     if ((Get-TailnetIdentity $fakeTailnet) -ne $ExpectedTailnet) { throw '目标 Tailnet 识别自检失败' }
 

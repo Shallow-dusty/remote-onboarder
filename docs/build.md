@@ -67,9 +67,11 @@ the Windows desktop.
    drive, payload presence, and payload hashes.
 2. Install/reuse Microsoft Win32-OpenSSH.
 3. generate missing host keys, merge the controller public key into both user
-   and administrators key files, apply SID-based ACLs, validate `sshd_config`
-   with `sshd -t`, and start `sshd`.
-4. Create/refresh the TCP 22 Windows Firewall rule.
+   and administrators key files, apply SID-based ACLs, disable SSH password and
+   keyboard-interactive authentication, validate `sshd_config` with `sshd -t`,
+   and start `sshd`.
+4. Recreate the TCP 22 Windows Firewall rule with remote addresses restricted
+   to the Tailscale IPv4 range `100.64.0.0/10`.
 5. Install/reuse Tailscale.
 6. Reuse an already-running session only when it belongs to
    `tailnet.example.ts.net`; otherwise force reauthentication with the embedded
