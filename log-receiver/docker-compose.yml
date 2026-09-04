@@ -1,0 +1,14 @@
+services:
+  log-receiver:
+    build: .
+    container_name: ssh-launchpad-log
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    networks:
+      - pulse
+
+networks:
+  pulse:
+    external: true
+    name: pulse-tracker_default

@@ -1,0 +1,4 @@
+{
+  "tailscaleAuthKey": "tskey-auth-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "publicKey": "ssh-ed25519 AAAA... controller-key-comment"
+}
