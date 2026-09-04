@@ -321,9 +321,22 @@ function Get-TargetDesktop {
     return $TargetProfile
 }
 
+function Get-OpenSshInstallDecision([bool]$ServiceExists, [bool]$BinaryExists) {
+    if (-not $ServiceExists) { return 'install' }
+    if (-not $BinaryExists) { return 'repair' }
+    return 'skip'
+}
+
 function Install-OpenSSH([string]$MsiPath) {
     Set-Step 'openssh-install' '第 2/7 步：安装或检查 OpenSSH'
     $service = Get-Service sshd -ErrorAction SilentlyContinue
+    $decision = Get-OpenSshInstallDecision ([bool]$service) ([bool](Find-SshBinary 'sshd.exe'))
+    if ($decision -eq 'repair') {
+        Write-SetupEvent WARN '检测到 sshd 服务但 sshd.exe 缺失（可能被杀毒软件误隔离），执行修复性重装'
+        [void](Invoke-NativeProcess -FilePath (Join-Path $env:SystemRoot 'System32\sc.exe') `
+            -Arguments 'delete sshd' -DisplayName '移除损坏的 sshd 服务' -TimeoutSeconds 60 -SuccessCodes @(0, 1060, 1062) -QuietOutput)
+        $service = Get-Service sshd -ErrorAction SilentlyContinue
+    }
     if (-not $service) {
         $msiLog = Join-Path $LogRoot ($script:SessionId + '-openssh-msi.log')
         $args = '/i "{0}" ADDLOCAL=Client,Server /qn /norestart /L*v "{1}"' -f $MsiPath, $msiLog
@@ -331,7 +344,7 @@ function Install-OpenSSH([string]$MsiPath) {
             -Arguments $args -DisplayName '安装 Microsoft Win32-OpenSSH' -TimeoutSeconds 600 -SuccessCodes @(0,1641,3010) -QuietOutput)
         $service = Get-Service sshd -ErrorAction SilentlyContinue
     } else {
-        Write-SetupEvent OK '检测到 sshd 服务，跳过重复安装'
+        Write-SetupEvent OK '检测到 sshd 服务与 sshd.exe，跳过重复安装'
     }
 
     if (-not $service) {
@@ -347,6 +360,7 @@ function Install-OpenSSH([string]$MsiPath) {
         }
     }
     if (-not $service) { throw 'OpenSSH 安装结束后仍未找到 sshd 服务' }
+    if (-not (Find-SshBinary 'sshd.exe')) { throw 'OpenSSH 安装结束后仍未找到 sshd.exe' }
     Write-SetupEvent OK 'OpenSSH 服务可用'
 }
 
@@ -544,6 +558,9 @@ function Invoke-SelfTest {
     if ($rendered -notmatch '(?m)^PasswordAuthentication no\r?$') { throw '未关闭 SSH 密码认证' }
     if ($rendered -notmatch '(?m)^KbdInteractiveAuthentication no\r?$') { throw '未关闭 SSH 键盘交互认证' }
     if ($TailscaleRemoteAddress -ne '100.64.0.0/10') { throw 'Tailscale 防火墙范围自检失败' }
+    if ((Get-OpenSshInstallDecision $false $false) -ne 'install') { throw '自检失败：缺少服务时应选择全新安装' }
+    if ((Get-OpenSshInstallDecision $true $false) -ne 'repair') { throw '自检失败：服务在但 sshd.exe 缺失时应选择修复重装' }
+    if ((Get-OpenSshInstallDecision $true $true) -ne 'skip') { throw '自检失败：服务与程序齐全时应跳过安装' }
     $fakeTailnet = '{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"tailnet.example.ts.net"}}' | ConvertFrom-Json
     if ((Get-TailnetIdentity $fakeTailnet) -ne $ExpectedTailnet) { throw '目标 Tailnet 识别自检失败' }
 

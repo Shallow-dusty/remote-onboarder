@@ -65,7 +65,10 @@ the Windows desktop.
 
 1. Preflight Windows x64, target profile, at least 500 MiB free on the system
    drive, payload presence, and payload hashes.
-2. Install/reuse Microsoft Win32-OpenSSH.
+2. Install/reuse Microsoft Win32-OpenSSH: skip only when both the `sshd`
+   service and the `sshd.exe` binary exist; when the service exists but the
+   binary is missing (e.g. quarantined by antivirus), the broken service is
+   removed and the MSI is reinstalled.
 3. generate missing host keys, merge the controller public key into both user
    and administrators key files, apply SID-based ACLs, disable SSH password and
    keyboard-interactive authentication, validate `sshd_config` with `sshd -t`,
