@@ -31,6 +31,12 @@ $script:ActiveEndpoint = $null
 $script:UploadRetryAfter = [DateTime]::MinValue
 $script:ExitCode = 1
 $script:Success = $false
+$script:Recovery = $null
+$script:RecoveryPath = ''
+$script:MutationLock = $null
+$script:LockHeld = $false
+$script:NativeUncertain = $false
+. (Join-Path $PSScriptRoot 'safety.ps1')
 
 function Get-SafeName([string]$Value) {
     $safe = $Value -replace '[^A-Za-z0-9._-]', '-'
@@ -42,14 +48,14 @@ $safeComputer = Get-SafeName $env:COMPUTERNAME
 $sessionStamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 $script:SessionId = '{0}-{1}-{2}' -f $sessionStamp, $safeComputer, $PID
 if ($SelfTest) {
-    $StateRoot = Join-Path $env:TEMP ('SSHLaunchpad-SelfTest-{0}' -f $PID)
+    $StateRoot = Join-Path $env:TEMP ('SSHLaunchpad-SelfTest-{0}' -f [guid]::NewGuid().ToString('N'))
+    $LogEndpoints = @() # Self-test is strictly local, never upload real identities.
 } else {
     $StateRoot = Join-Path $env:ProgramData 'SSHLaunchpad'
 }
 $LogRoot = Join-Path $StateRoot 'logs'
 $BackupRoot = Join-Path $StateRoot 'backups'
 $PayloadRoot = Join-Path $StateRoot 'payloads'
-New-Item -ItemType Directory -Force -Path $LogRoot, $BackupRoot, $PayloadRoot | Out-Null
 $script:TextLog = Join-Path $LogRoot ($script:SessionId + '.log')
 $script:JsonLog = Join-Path $LogRoot ($script:SessionId + '.jsonl')
 $script:UploadQueue = Join-Path $LogRoot ($script:SessionId + '.upload-queue.jsonl')
@@ -64,7 +70,7 @@ function Invoke-Upload([string]$Json) {
     foreach ($endpoint in $ordered) {
         try {
             Invoke-RestMethod -Method Post -Uri $endpoint -ContentType 'application/json; charset=utf-8' `
-                -Body $body -TimeoutSec 4 -UseBasicParsing | Out-Null
+                -Body $body -TimeoutSec 4 -MaximumRedirection 0 -UseBasicParsing | Out-Null
             $script:ActiveEndpoint = $endpoint
             return $true
         } catch { }
@@ -102,6 +108,7 @@ function Write-SetupEvent {
         [string]$Message,
         [string]$Step = $script:CurrentStep
     )
+    $Message = Protect-SetupText $Message
     $script:Sequence++
     $now = [DateTime]::UtcNow.ToString('o')
     $line = '{0} [{1}] [{2}] {3}' -f $now, $Level, $Step, $Message
@@ -127,6 +134,7 @@ function Write-SetupEvent {
     }
     Write-Host ('[{0,-5}] {1}' -f $Level, $Message) -ForegroundColor $color
 
+    if ($LogEndpoints.Count -eq 0) { return }
     Flush-UploadQueue
     if ([DateTime]::UtcNow -ge $script:UploadRetryAfter) {
         if (-not (Invoke-Upload $json)) {
@@ -175,12 +183,20 @@ function Invoke-NativeProcess {
     $info.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $info
+    $installer = [IO.Path]::GetFileName($FilePath) -ieq 'msiexec.exe'
+    $installerMarker = Join-Path $StateRoot 'installer-pending.txt'
+    $nativeMarker = Join-Path $StateRoot 'native-pending.txt'
+    $authenticating = [IO.Path]::GetFileName($FilePath) -ieq 'tailscale.exe' -and $Arguments -match '^up '
+    if ($authenticating) { [IO.File]::WriteAllText($nativeMarker, $DisplayName) }
+    if ($installer) { [IO.File]::WriteAllText($installerMarker, $DisplayName) }
     if (-not $process.Start()) { throw "无法启动：$DisplayName" }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        $script:NativeUncertain = $true
+        [IO.File]::WriteAllText($nativeMarker, $DisplayName)
         try { $process.Kill() } catch { }
-        throw "$DisplayName 超时（${TimeoutSeconds}s）"
+        throw "$DisplayName 超时（${TimeoutSeconds}s）；子进程/系统安装服务可能仍在运行，请人工确认，不会自动开始恢复"
     }
     $process.WaitForExit()
     $stdout = $stdoutTask.Result.Trim()
@@ -191,10 +207,14 @@ function Invoke-NativeProcess {
     }
     if ($SuccessCodes -notcontains $process.ExitCode) {
         $detail = if ($stderr) { $stderr } elseif ($stdout) { $stdout } else { '没有额外输出' }
-        throw "$DisplayName 失败，退出码=$($process.ExitCode)：$detail"
+        throw (Protect-SetupText "$DisplayName 失败，退出码=$($process.ExitCode)：$detail")
     }
+    if ($installer) { Remove-Item -LiteralPath $installerMarker -Force -ErrorAction Stop }
+    if ($authenticating) { Remove-Item -LiteralPath $nativeMarker -Force -ErrorAction Stop }
     Write-SetupEvent OK ("完成：$DisplayName（退出码=$($process.ExitCode)）") process
-    return [pscustomobject]@{ ExitCode=$process.ExitCode; StdOut=$stdout; StdErr=$stderr }
+    $result = [pscustomobject]@{ ExitCode=$process.ExitCode; StdOut=$stdout; StdErr=$stderr }
+    $process.Dispose()
+    return $result
 }
 
 function Get-TargetSid([string]$ProfilePath, [string]$UserName) {
@@ -249,6 +269,8 @@ function Merge-PublicKey([string]$Path, [string]$Key) {
 function Get-ManagedSshConfig([string]$Existing) {
     $pattern = '(?ms)^\s*# BEGIN SSH-LAUNCHPAD-ONECLICK\s*$.*?^\s*# END SSH-LAUNCHPAD-ONECLICK\s*$(\r?\n)?'
     $clean = [regex]::Replace($Existing, $pattern, '')
+    Assert-SimpleSshPolicy $clean
+    $clean = [regex]::Replace($clean, '(?im)^[ \t]*Port[ \t]+[^\r\n]*(\r?\n|$)', '')
     $block = @(
         '# BEGIN SSH-LAUNCHPAD-ONECLICK',
         ('Port {0}' -f $SshPort),
@@ -325,18 +347,20 @@ function Get-OpenSshInstallDecision([bool]$ServiceExists, [bool]$BinaryExists) {
 }
 
 function Install-OpenSSH([string]$MsiPath) {
-    Set-Step 'openssh-install' '第 2/7 步：安装或检查 OpenSSH'
+    Set-Step 'openssh-install' '第 4/7 步：安装或检查 OpenSSH'
     $service = Get-Service sshd -ErrorAction SilentlyContinue
     $decision = Get-OpenSshInstallDecision ([bool]$service) ([bool](Find-SshBinary 'sshd.exe'))
     if ($decision -eq 'repair') {
-        Write-SetupEvent WARN '检测到 sshd 服务但 sshd.exe 缺失（可能被杀毒软件误隔离），执行修复性重装'
-        [void](Invoke-NativeProcess -FilePath (Join-Path $env:SystemRoot 'System32\sc.exe') `
-            -Arguments 'delete sshd' -DisplayName '移除损坏的 sshd 服务' -TimeoutSeconds 60 -SuccessCodes @(0, 1060, 1062) -QuietOutput)
-        $service = Get-Service sshd -ErrorAction SilentlyContinue
+        $registration = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
+        $registeredPath = ([Environment]::ExpandEnvironmentVariables([string]$registration.PathName)).Trim('"')
+        $knownPaths = @((Join-Path $env:ProgramFiles 'OpenSSH\sshd.exe'), (Join-Path $env:ProgramFiles 'OpenSSH-Win64\sshd.exe'))
+        if ($registeredPath -notin $knownPaths) { throw '损坏的 sshd 不属于支持的 MSI 路径；请用原安装方式修复，不会删除服务' }
+        Write-SetupEvent WARN '检测到 MSI 安装路径的 sshd.exe 缺失，尝试修复 MSI；保留现有服务注册'
     }
-    if (-not $service) {
+    if (-not $service -or $decision -eq 'repair') {
         $msiLog = Join-Path $LogRoot ($script:SessionId + '-openssh-msi.log')
         $args = '/i "{0}" ADDLOCAL=Client,Server /qn /norestart /L*v "{1}"' -f $MsiPath, $msiLog
+        if ($decision -eq 'repair') { $args += ' REINSTALL=ALL REINSTALLMODE=vomus' }
         [void](Invoke-NativeProcess -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
             -Arguments $args -DisplayName '安装 Microsoft Win32-OpenSSH' -TimeoutSeconds 600 -SuccessCodes @(0,1641,3010) -QuietOutput)
         $service = Get-Service sshd -ErrorAction SilentlyContinue
@@ -362,7 +386,7 @@ function Install-OpenSSH([string]$MsiPath) {
 }
 
 function Configure-OpenSSH {
-    Set-Step 'openssh-config' '第 3/7 步：写入公钥并配置 OpenSSH'
+    Set-Step 'openssh-config' '第 6/7 步：写入公钥并配置 OpenSSH'
     $sshd = Find-SshBinary 'sshd.exe'
     $sshKeygen = Find-SshBinary 'ssh-keygen.exe'
     if (-not $sshd -or -not $sshKeygen) { throw '找不到 OpenSSH 核心程序 sshd.exe / ssh-keygen.exe' }
@@ -423,17 +447,20 @@ function Configure-OpenSSH {
 }
 
 function Configure-Firewall {
-    Set-Step 'firewall' '第 4/7 步：配置 Windows 防火墙'
+    Set-Step 'firewall' '第 5/7 步：配置 Windows 防火墙'
     $ruleName = 'SSH-Launchpad-OneClick-22'
-    Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-    New-NetFirewallRule -Name $ruleName -DisplayName 'SSH Launchpad OneClick (TCP 22, Tailscale only)' `
-        -Enabled True -Direction Inbound -Protocol TCP -LocalPort $SshPort `
-        -RemoteAddress $TailscaleRemoteAddress -Action Allow -Profile Any | Out-Null
+    foreach ($name in $script:Recovery.UnsafeNames) { Disable-NetFirewallRule -Name $name -ErrorAction Stop }
+    if (-not $script:Recovery.ManagedExisted) {
+        New-NetFirewallRule -Name $ruleName -DisplayName 'SSH Launchpad OneClick (TCP 22, Tailscale only)' `
+            -Enabled True -Direction Inbound -Protocol TCP -LocalPort $SshPort `
+            -RemoteAddress $TailscaleRemoteAddress -Action Allow -Profile Any | Out-Null
+    }
+    if (@(Get-UnsafeSshRules).Count -gt 0) { throw '仍有宽放行规则，停止配置' }
     Write-SetupEvent OK ("TCP 22 仅允许 Tailscale 地址范围：$TailscaleRemoteAddress")
 }
 
 function Install-Tailscale([string]$MsiPath) {
-    Set-Step 'tailscale-install' '第 5/7 步：安装或检查 Tailscale'
+    Set-Step 'tailscale-install' '第 2/7 步：安装或检查 Tailscale'
     $tailscale = Find-TailscaleExe
     if (-not $tailscale) {
         $msiLog = Join-Path $LogRoot ($script:SessionId + '-tailscale-msi.log')
@@ -455,7 +482,7 @@ function Install-Tailscale([string]$MsiPath) {
 }
 
 function Connect-Tailscale([string]$TailscaleExe) {
-    Set-Step 'tailscale-connect' '第 6/7 步：接入 Tailscale 网络'
+    Set-Step 'tailscale-connect' '第 3/7 步：接入 Tailscale 网络'
     $state = $null
     try {
         $statusResult = Invoke-NativeProcess -FilePath $TailscaleExe -Arguments 'status --json' `
@@ -465,17 +492,17 @@ function Connect-Tailscale([string]$TailscaleExe) {
             $state = $status.BackendState
         }
     } catch {
-        Write-SetupEvent WARN ("首次状态读取失败，将继续尝试登录：$($_.Exception.Message)")
+        throw '无法读取 Tailscale 状态，未尝试重新登录；请检查客户端后重试'
     }
 
     $currentTailnet = if ($state -eq 'Running') { Get-TailnetIdentity $status } else { '' }
     if ($state -eq 'Running' -and $currentTailnet -eq $ExpectedTailnet) {
         Write-SetupEvent OK ("设备已在目标 Tailnet 在线：$ExpectedTailnet，跳过重复登录")
     } else {
-        if ($state -eq 'Running') {
-            Write-SetupEvent WARN ("当前 Tailnet '$currentTailnet' 不是目标 '$ExpectedTailnet'，将重新认证")
+        if ($state -notin @('NeedsLogin', 'NoState')) {
+            throw '当前 Tailnet 不匹配、未确认或处于停止状态；请在本地确认后手动处理，不会强制切换网络'
         }
-        $arguments = 'up --reset --force-reauth --auth-key={0} --hostname={1} --timeout=120s' -f $TailscaleAuthKey, $safeComputer
+        $arguments = 'up --auth-key={0} --hostname={1} --timeout=120s' -f $TailscaleAuthKey, $safeComputer
         [void](Invoke-NativeProcess -FilePath $TailscaleExe -Arguments $arguments `
             -DisplayName '使用内置一次性密钥接入目标 Tailnet（密钥不写入日志）' -TimeoutSeconds 180 -QuietOutput)
     }
@@ -505,26 +532,34 @@ function Verify-Result([string]$TailscaleIP) {
     }
     $userKeys = Join-Path $TargetProfile '.ssh\authorized_keys'
     if (-not (Select-String -LiteralPath $userKeys -SimpleMatch $PublicKey -Quiet)) { throw '最终检查发现目标用户公钥缺失' }
-    $firewallRule = Get-NetFirewallRule -Name 'SSH-Launchpad-OneClick-22' -ErrorAction SilentlyContinue
+    if (@(Get-UnsafeSshRules).Count -gt 0) { throw '最终检查发现额外 SSH 放行规则' }
+    $firewallRule = Get-NetFirewallRule -PolicyStore ActiveStore -Name 'SSH-Launchpad-OneClick-22' -ErrorAction Stop
     $firewallPort = $firewallRule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
     $firewallAddress = $firewallRule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
     $firewallRemoteAddresses = @($firewallAddress.RemoteAddress)
     $firewallScopeValid = $firewallRemoteAddresses.Count -eq 1 -and
         $firewallRemoteAddresses[0] -in @($TailscaleRemoteAddress, $TailscaleRemoteAddressNormalized)
-    if (-not $firewallRule -or [string]$firewallPort.Protocol -ne 'TCP' -or
+    if (-not $firewallRule -or [string]$firewallRule.Enabled -ne 'True' -or [string]$firewallRule.Action -ne 'Allow' -or [string]$firewallRule.Direction -ne 'Inbound' -or [string]$firewallPort.Protocol -ne 'TCP' -or
         [string]$firewallPort.LocalPort -ne [string]$SshPort -or -not $firewallScopeValid) {
         throw "最终检查发现 TCP $SshPort 防火墙规则未限制到 $TailscaleRemoteAddress"
     }
-    Write-SetupEvent OK 'sshd 正在监听、公钥存在、防火墙仅限 Tailscale、Tailscale 在线'
+    $sshd = Find-SshBinary 'sshd.exe'
+    $effective = Invoke-NativeProcess -FilePath $sshd -Arguments '-T' -DisplayName '检查有效 SSH 策略' -TimeoutSeconds 30 -QuietOutput
+    foreach ($required in @('port 22', 'passwordauthentication no', 'kbdinteractiveauthentication no', 'pubkeyauthentication yes')) {
+        if (($effective.StdOut -split '\r?\n') -notcontains $required) { throw ('有效 SSH 策略不满足：' + $required) }
+    }
+    if (@($effective.StdOut -split '\r?\n' | Where-Object { $_ -match '^port ' }).Count -ne 1) { throw '检测到额外 SSH 端口' }
+    Write-SetupEvent OK '本机检查通过；仍需控制电脑实际连接验证，不能据此证明远端可达'
 
     $sshCommand = 'ssh {0}@{1}' -f $TargetUser, $TailscaleIP
     $result = @(
-        'SSH Launchpad 一键接入成功',
+        'SSH Launchpad 本机配置检查通过（等待控制电脑试连）',
         ('时间：{0}' -f (Get-Date)),
         ('目标用户名：{0}' -f $TargetUser),
         ('主机名：{0}' -f $env:COMPUTERNAME),
         ('Tailscale IP：{0}' -f $TailscaleIP),
         ('连接命令：{0}' -f $sshCommand),
+        '首次连接请核对 SSH 主机指纹。此文件不含私钥或登录密钥。',
         ('本机日志：{0}' -f $script:TextLog),
         ('会话编号：{0}' -f $script:SessionId)
     ) -join "`r`n"
@@ -538,7 +573,7 @@ function Verify-Result([string]$TailscaleIP) {
     Write-Host ('Tailscale IP : {0}' -f $TailscaleIP) -ForegroundColor Green
     Write-Host ('Windows 用户 : {0}' -f $TargetUser) -ForegroundColor Green
     Write-Host ('连接命令      : {0}' -f $sshCommand) -ForegroundColor Yellow
-    Write-Host '把「SSH-连接信息.txt」发回给 Shallow 即可。' -ForegroundColor Cyan
+    Write-Host '下一步：把「SSH-连接信息.txt」发给协助者，让对方实际试连。' -ForegroundColor Cyan
 }
 
 function Invoke-SelfTest {
@@ -548,7 +583,7 @@ function Invoke-SelfTest {
     Assert-Payload $sourceOpenSsh $OpenSshPayloadSHA256
     Assert-Payload $sourceTailscale $TailscalePayloadSHA256
 
-    $sample = "# comment`r`n# BEGIN SSH-LAUNCHPAD-ONECLICK`r`nPort 99`r`n# END SSH-LAUNCHPAD-ONECLICK`r`nMatch Group administrators`r`n  AuthorizedKeysFile old"
+    $sample = "# comment`r`n# BEGIN SSH-LAUNCHPAD-ONECLICK`r`nPort 99`r`n# END SSH-LAUNCHPAD-ONECLICK`r`nMatch Group administrators`r`n  AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys"
     $rendered = Get-ManagedSshConfig $sample
     if (($rendered -split '# BEGIN SSH-LAUNCHPAD-ONECLICK').Count -ne 2) { throw '托管配置块未保持单例' }
     if ($rendered.IndexOf('# BEGIN SSH-LAUNCHPAD-ONECLICK') -gt $rendered.IndexOf('Match Group')) { throw '托管配置块未位于 Match 之前' }
@@ -586,9 +621,22 @@ function Invoke-SelfTest {
 }
 
 try {
+    if (-not $SelfTest) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw '需要管理员权限；未修改系统' }
+        if ($env:SSH_CONNECTION -or $env:SSH_CLIENT) { throw '请在目标电脑本地运行；不会在活动 SSH 会话中修改连接路径' }
+        $script:MutationLock = New-Object Threading.Mutex($false, 'Global\SSHLaunchpad-System-Mutation-v1')
+        try { $script:LockHeld = $script:MutationLock.WaitOne(0) } catch [Threading.AbandonedMutexException] { $script:LockHeld = $true; throw '上次运行被中断；请人工检查恢复快照后再运行' }
+        if (-not $script:LockHeld) { throw '另一个安装/恢复进程正在运行，请等待结束' }
+        Initialize-ProtectedState
+    }
+    New-Item -ItemType Directory -Force -Path $LogRoot, $BackupRoot, $PayloadRoot | Out-Null
     Clear-Host
     Write-Host 'SSH + Tailscale 一键接入工具' -ForegroundColor Cyan
     Write-Host ('版本 {0}，会话 {1}' -f $ToolVersion, $script:SessionId) -ForegroundColor DarkGray
+    Write-Host '这台电脑将允许控制者通过公钥连接；请保持窗口打开，完成后把连接信息发给协助者。'
+    Write-Host '软件安装和登录不能完全撤销；出错时请保留日志，不要重复运行。' -ForegroundColor Yellow
     Write-SetupEvent INFO ("程序启动；目标用户=$TargetUser；目标目录=$TargetProfile")
 
     if ($SelfTest) {
@@ -624,24 +672,37 @@ try {
         Assert-Payload $openSshMsi $OpenSshPayloadSHA256
         Assert-Payload $tailscaleMsi $TailscalePayloadSHA256
 
-        Install-OpenSSH $openSshMsi
-        Configure-OpenSSH
-        Configure-Firewall
+        # Reject unsupported existing policy before touching services.
+        $existingConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
+        Assert-NoReparsePath $existingConfig
+        if (Test-Path -LiteralPath $existingConfig) { Assert-SimpleSshPolicy ([IO.File]::ReadAllText($existingConfig)) }
+        [void]@(Get-UnsafeSshRules)
         $tailscale = Install-Tailscale $tailscaleMsi
         $tailscaleIP = Connect-Tailscale $tailscale
+        Install-OpenSSH $openSshMsi
+        Save-RecoverySnapshot
+        Configure-Firewall
+        Configure-OpenSSH
         Verify-Result $tailscaleIP
+        Remove-Item -LiteralPath (Join-Path $StateRoot 'recovery-pending.txt') -Force -ErrorAction Stop
         $script:Success = $true
         $script:ExitCode = 0
         Remove-Item -LiteralPath $PayloadRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 } catch {
-    try { Write-SetupEvent ERROR $_.Exception.Message } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+    $failure = Protect-SetupText $_.Exception.Message
+    try { Write-SetupEvent ERROR $failure } catch { Write-Host $failure -ForegroundColor Red }
+    if (-not $SelfTest -and $script:Recovery -and -not $script:NativeUncertain) {
+        try { Restore-RecoverySnapshot } catch { Write-Host ('自动恢复未完成：' + (Protect-SetupText $_.Exception.Message)) -ForegroundColor Red }
+    }
     Write-Host ''
-    Write-Host '执行失败。可直接重新运行，本工具会从实际系统状态继续。' -ForegroundColor Red
+    Write-Host '未完成。请保留日志并交给协助者；先确认错误及恢复状态，不要反复点击安装。' -ForegroundColor Red
     Write-Host ('日志位置：{0}' -f $script:TextLog) -ForegroundColor Yellow
     Write-Host ('会话编号：{0}' -f $script:SessionId) -ForegroundColor Yellow
     $script:ExitCode = 1
 } finally {
+    if ($script:LockHeld -and $script:MutationLock) { $script:MutationLock.ReleaseMutex() }
+    if ($script:MutationLock) { $script:MutationLock.Dispose() }
     try { Flush-UploadQueue -Force } catch { }
     if (-not $SelfTest) {
         try {
@@ -651,6 +712,7 @@ try {
             }
         } catch { }
     }
+    if ($SelfTest -and (Test-Path -LiteralPath $StateRoot)) { Remove-Item -LiteralPath $StateRoot -Recurse -Force }
     if (-not $NoPause) {
         Write-Host ''
         Read-Host '按回车键关闭窗口' | Out-Null

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,7 +20,13 @@ import (
 	"time"
 )
 
-const maxEventBytes = 1 << 20
+const maxEventBytes = 64 << 10
+const maxSessionBytes = 16 << 20
+const maxStorageBytes = 256 << 20
+const maxSessions = 1000
+
+var errStorageFull = errors.New("log storage limit reached")
+var authKeyPattern = regexp.MustCompile(`tskey-[A-Za-z0-9_-]+`)
 
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
@@ -67,6 +74,10 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/sessions/", s.handleSession)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
 		mux.ServeHTTP(w, r)
 	})
 }
@@ -117,6 +128,8 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "message is required", http.StatusBadRequest)
 		return
 	}
+	// Defense in depth: native process errors must not persist an auth key.
+	incoming.Message = authKeyPattern.ReplaceAllString(incoming.Message, "[REDACTED]")
 	stored := storedEvent{
 		event:      incoming,
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -128,6 +141,10 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.appendEvent(incoming.SessionID, encoded); err != nil {
+		if errors.Is(err, errStorageFull) {
+			http.Error(w, "log storage limit reached; archive records before retrying", http.StatusInsufficientStorage)
+			return
+		}
 		log.Printf("append %s/%d: %v", incoming.SessionID, incoming.Sequence, err)
 		http.Error(w, "store event", http.StatusInternalServerError)
 		return
@@ -149,7 +166,37 @@ func (s *server) appendEvent(sessionID string, encoded []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	path := filepath.Join(s.dataDir, sessionID+".jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	entries, err := os.ReadDir(s.dataDir)
+	if err != nil {
+		return err
+	}
+	var total int64
+	count := 0
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".jsonl" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("non-regular log entry")
+		}
+		total += info.Size()
+		count++
+	}
+	info, err := os.Lstat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err == nil && !info.Mode().IsRegular() {
+		return errors.New("non-regular session file")
+	}
+	if total+int64(len(encoded)+1) > maxStorageBytes || (info == nil && count >= maxSessions) || (info != nil && info.Size()+int64(len(encoded)+1) > maxSessionBytes) {
+		return errStorageFull
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -176,7 +223,7 @@ func (s *server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		info, err := entry.Info()
-		if err != nil {
+		if err != nil || !info.Mode().IsRegular() || !sessionIDPattern.MatchString(strings.TrimSuffix(entry.Name(), ".jsonl")) {
 			continue
 		}
 		result = append(result, sessionInfo{
@@ -200,21 +247,18 @@ func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := filepath.Join(s.dataDir, id+".jsonl")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 	http.ServeFile(w, r, path)
 }
 
-var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
-<html><head><meta charset="utf-8"><title>SSH Launchpad Logs</title>
-<style>body{font:14px ui-monospace,Consolas,monospace;margin:24px;background:#111827;color:#e5e7eb}a{color:#60a5fa}button{margin:4px;padding:8px}pre{white-space:pre-wrap;background:#030712;padding:16px;border-radius:8px;max-height:70vh;overflow:auto}.muted{color:#9ca3af}</style></head>
-<body><h1>SSH Launchpad live logs</h1><div id="sessions" class="muted">Loading...</div><pre id="log">Select a session.</pre>
-<script>
-let selected='';
-async function sessions(){const r=await fetch('sessions');const xs=await r.json();document.getElementById('sessions').innerHTML=xs.map(x=>'<button onclick="pick(\''+x.sessionId+'\')">'+x.sessionId+' · '+x.updatedAt+'</button>').join('')||'No sessions yet.';}
-function pick(id){selected=id;load();}
-async function load(){if(!selected)return;const r=await fetch('sessions/'+encodeURIComponent(selected)+'?t='+Date.now());document.getElementById('log').textContent=await r.text();const p=document.getElementById('log');p.scrollTop=p.scrollHeight;}
-setInterval(()=>{sessions();load()},2000);sessions();
-</script></body></html>`))
+//go:embed dashboard.html
+var dashboardHTML string
+var indexTemplate = template.Must(template.New("index").Parse(dashboardHTML))
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" || r.Method != http.MethodGet {
@@ -245,7 +289,7 @@ func remoteIP(remote string) string {
 }
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address (place behind an authenticated private reverse proxy)")
 	data := flag.String("data", "/data", "data directory")
 	flag.Parse()
 	s, err := newServer(*data)

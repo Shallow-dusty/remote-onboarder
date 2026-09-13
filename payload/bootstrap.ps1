@@ -15,6 +15,7 @@ if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
 }
 
 try {
+    if (-not $SelfTest -and ($env:SSH_CONNECTION -or $env:SSH_CLIENT)) { throw 'Run locally on the target computer; active SSH sessions are not supported.' }
     $arguments = @(
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',

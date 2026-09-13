@@ -2,7 +2,10 @@
 set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+umask 077
 config=${1:-"$repo/build/oneclick/private-config.json"}
+mode=${2:-package}
+[[ "$mode" == package || "$mode" == --validate-only ]] || { printf 'expected --validate-only or package\n' >&2; exit 1; }
 payload_dir="$repo/build/oneclick/payloads"
 source_dir="$repo/payload"
 
@@ -13,11 +16,9 @@ command -v powershell.exe >/dev/null || fail 'Windows PowerShell is required (ru
 command -v iexpress.exe >/dev/null || fail 'Windows IExpress is required (run from WSL)'
 [[ -f "$config" ]] || fail "private config not found: $config"
 
-auth_key=$(jq -er '.tailscaleAuthKey | select(type=="string" and startswith("tskey-auth-") and length>20)' "$config") || fail 'invalid tailscaleAuthKey in private config'
-public_key=$(jq -er '.publicKey | select(type=="string" and startswith("ssh-") and length>40)' "$config") || fail 'invalid publicKey in private config'
-expected_tailnet=$(jq -er '.expectedTailnet | select(type=="string" and length>5 and contains("."))' "$config") || fail 'invalid expectedTailnet in private config'
-log_endpoints=$(jq -c '.logEndpoints // [] | select(type=="array")' "$config") || fail 'invalid logEndpoints in private config'
-jq -e '.logEndpoints // [] | length == 0 or all(type == "string" and startswith("http"))' "$config" >/dev/null || fail 'logEndpoints must be http(s) URLs'
+command -v python3 >/dev/null || fail 'python3 is required'
+# Do not export credentials through the environment or print generated source.
+[[ $(stat -c '%a' "$config") == 600 ]] || fail 'private config must have mode 0600'
 
 mkdir -p "$payload_dir"
 openssh_name='OpenSSH-Win64-v10.0.0.0.msi'
@@ -29,61 +30,44 @@ fetch() {
   local url=$1 output=$2
   if [[ ! -s "$output" ]]; then
     printf 'Downloading %s\n' "$(basename "$output")"
-    curl -fL --retry 4 --retry-delay 2 --continue-at - --output "$output" "$url"
+    curl -fL --proto '=https' --proto-redir '=https' --retry 4 --retry-delay 2 --continue-at - --output "$output.part" "$url"
+    mv "$output.part" "$output"
   fi
 }
 fetch "$openssh_url" "$payload_dir/$openssh_name"
 fetch "$tailscale_url" "$payload_dir/$tailscale_name"
 
-openssh_sha=$(sha256sum "$payload_dir/$openssh_name" | awk '{print $1}')
-tailscale_sha=$(sha256sum "$payload_dir/$tailscale_name" | awk '{print $1}')
+openssh_sha='ddec9c53864280759cf9f74791cefd387100e3946aa849a1c138a4ed1b96b7d9'
+tailscale_sha='03ac8183c6e3ce276e9b44281ebe7e4c02aef28a971034ca170c4b665df42dce'
+printf '%s  %s\n%s  %s\n' "$openssh_sha" "$payload_dir/$openssh_name" "$tailscale_sha" "$payload_dir/$tailscale_name" | sha256sum -c - || fail 'pinned payload hash mismatch'
 
 # shellcheck disable=SC2016 # $env:TEMP is intentionally evaluated by Windows PowerShell.
 win_temp=$(powershell.exe -NoProfile -Command '$env:TEMP' | tr -d '\r' | tail -n1)
 [[ "$win_temp" =~ ^[A-Za-z]:\\ ]] || fail "unexpected Windows TEMP: $win_temp"
-stage_win="${win_temp}\\ssh-launchpad-oneclick-build"
+stage_win="${win_temp}\\ssh-launchpad-oneclick-build-$(date +%s)-$$"
 stage=$(wslpath -u "$stage_win")
-output_win="${win_temp}\\SSH-Launchpad-OneClick-Windows-x64.exe"
+output_win="${stage_win}\\SSH-Launchpad-OneClick-Windows-x64.exe"
 output=$(wslpath -u "$output_win")
 sed_win="${stage_win}\\package.sed"
 sed_path="$stage/package.sed"
 
 powershell.exe -NoProfile -Command "Remove-Item -LiteralPath '$stage_win' -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force -Path '$stage_win' | Out-Null; Remove-Item -LiteralPath '$output_win' -Force -ErrorAction SilentlyContinue; exit 0"
 mkdir -p "$stage"
-cp "$source_dir/launcher.cmd" "$source_dir/bootstrap.ps1" "$stage/"
+cp "$source_dir/launcher.cmd" "$source_dir/bootstrap.ps1" "$source_dir/safety.ps1" "$stage/"
 cp "$payload_dir/$openssh_name" "$payload_dir/$tailscale_name" "$stage/"
 
-SOURCE_SETUP="$source_dir/setup.ps1" OUTPUT_SETUP="$stage/setup.ps1" \
-AUTH_KEY="$auth_key" PUBLIC_KEY="$public_key" OPENSSH_SHA="$openssh_sha" TAILSCALE_SHA="$tailscale_sha" \
-EXPECTED_TAILNET="$expected_tailnet" LOG_ENDPOINTS_JSON="$log_endpoints" \
-python3 - <<'PY'
-from pathlib import Path
-import os
-source = Path(os.environ['SOURCE_SETUP']).read_text(encoding='utf-8-sig')
-values = {
-    '__TAILSCALE_AUTH_KEY__': os.environ['AUTH_KEY'],
-    '__SSH_PUBLIC_KEY__': os.environ['PUBLIC_KEY'],
-    '__OPENSSH_SHA256__': os.environ['OPENSSH_SHA'],
-    '__TAILSCALE_SHA256__': os.environ['TAILSCALE_SHA'],
-    '__EXPECTED_TAILNET__': os.environ['EXPECTED_TAILNET'],
-    '__LOG_ENDPOINTS_JSON__': '@(' + ', '.join("'%s'" % e for e in __import__('json').loads(os.environ['LOG_ENDPOINTS_JSON'])) + ')',
-}
-for marker, value in values.items():
-    if marker not in source:
-        raise SystemExit(f'missing template marker: {marker}')
-    source = source.replace(marker, value)
-if '__' in source and any(marker in source for marker in values):
-    raise SystemExit('unreplaced template marker')
-Path(os.environ['OUTPUT_SETUP']).write_text(source, encoding='utf-8-sig', newline='\r\n')
-PY
+# Remove only this invocation's unique credential-bearing staging directory.
+trap 'powershell.exe -NoProfile -Command "Remove-Item -LiteralPath '\''$stage_win'\'' -Recurse -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1' EXIT
+python3 "$repo/scripts/render-setup.py" "$source_dir/setup.ps1" "$config" "$stage/setup.ps1" "$openssh_sha" "$tailscale_sha"
 
 # Parse the exact generated PowerShell on Windows PowerShell 5.1.
 powershell.exe -NoProfile -Command "\$e=\$null; [void][System.Management.Automation.Language.Parser]::ParseFile('$stage_win\\setup.ps1',[ref]\$null,[ref]\$e); if(\$e.Count){\$e | ForEach-Object { Write-Error (\$_.Extent.StartLineNumber.ToString()+': '+\$_.Message) }; exit 1}; 'PowerShell syntax: OK'"
 
 # Require the official payload signatures before packaging.
-powershell.exe -NoProfile -Command "\$files=@('$stage_win\\$openssh_name','$stage_win\\$tailscale_name'); foreach(\$f in \$files){\$s=Get-AuthenticodeSignature -LiteralPath \$f; Write-Host ((Split-Path \$f -Leaf)+': '+\$s.Status+' / '+\$s.SignerCertificate.Subject); if(\$s.Status -ne 'Valid'){exit 1}}"
+powershell.exe -NoProfile -Command "\$files=@('$stage_win\\$openssh_name','$stage_win\\$tailscale_name'); foreach(\$f in \$files){\$s=Get-AuthenticodeSignature -LiteralPath \$f; Write-Host ((Split-Path \$f -Leaf)+': '+\$s.Status+' / '+\$s.SignerCertificate.Subject); \$vendor=if(\$f -like '*OpenSSH*'){'Microsoft Corporation'}else{'Tailscale Inc.'}; if(\$s.Status -ne 'Valid' -or \$s.SignerCertificate.Subject -notlike ('*O='+\$vendor+',*')){exit 1}}"
 
-# Safe self-test: exercises hashes, idempotent config/key transforms, process wrapper and live log upload.
+# Safe self-test: hashes, temporary config/key transforms and process wrapper.
+# It never uploads device identities or touches live SSH/firewall services.
 set +e
 selftest_output=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage_win\\setup.ps1" -SelfTest -NoPause 2>&1)
 selftest_code=$?
@@ -92,13 +76,10 @@ printf '%s\n' "$selftest_output"
 [[ $selftest_code -eq 0 ]] || fail "generated setup self-test failed ($selftest_code)"
 session=$(printf '%s\n' "$selftest_output" | tr -d '\r' | grep -oE 'SELFTEST_SESSION=[A-Za-z0-9._-]+' | tail -n1 | cut -d= -f2)
 [[ -n "$session" ]] || fail 'self-test session id missing'
-first_endpoint=$(printf '%s' "$log_endpoints" | jq -r '.[0] // empty')
-if [[ -n "$first_endpoint" && "$first_endpoint" == */events ]]; then
-  verify_url="${first_endpoint%/events}/sessions/$session"
-  curl -fsS "$verify_url" | grep -q 'SELFTEST_SESSION' || fail 'server did not persist self-test log'
-  printf 'Remote log verification: OK (%s)\n' "$session"
-else
-  printf 'Remote log verification: skipped (no /events endpoint configured)\n'
+printf 'Self-test passed (remote logging disabled).\n'
+if [[ "$mode" == --validate-only ]]; then
+  printf 'Validation complete; no EXE packaged or copied to Desktop.\n'
+  exit 0
 fi
 
 TARGET_NAME="$output_win" STAGE_WIN="$stage_win" SED_PATH="$sed_path" python3 - <<'PY'
@@ -106,7 +87,7 @@ from pathlib import Path
 import os
 stage = os.environ['STAGE_WIN']
 target = os.environ['TARGET_NAME']
-files = ['launcher.cmd', 'bootstrap.ps1', 'setup.ps1', 'OpenSSH-Win64-v10.0.0.0.msi', 'tailscale-setup-1.102.3-amd64.msi']
+files = ['launcher.cmd', 'bootstrap.ps1', 'safety.ps1', 'setup.ps1', 'OpenSSH-Win64-v10.0.0.0.msi', 'tailscale-setup-1.102.3-amd64.msi']
 strings = [
     '[Version]', 'Class=IEXPRESS', 'SEDVersion=3', '',
     '[Options]', 'PackagePurpose=InstallApp', 'ShowInstallProgramWindow=1',
@@ -139,7 +120,7 @@ inspect_dir="$stage/inspect"
 rm -rf "$inspect_dir"
 mkdir -p "$inspect_dir"
 7z x -y -o"$inspect_dir" "$output" >/dev/null
-for f in launcher.cmd bootstrap.ps1 setup.ps1 "$openssh_name" "$tailscale_name"; do
+for f in launcher.cmd bootstrap.ps1 safety.ps1 setup.ps1 "$openssh_name" "$tailscale_name"; do
   [[ -f "$inspect_dir/$f" ]] || fail "SFX missing: $f"
   cmp "$stage/$f" "$inspect_dir/$f" || fail "SFX content mismatch: $f"
 done
