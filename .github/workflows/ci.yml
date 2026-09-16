@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  receiver:
+    name: Log receiver (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: log-receiver/go.mod
+          cache: false
+      - name: Vet and test
+        working-directory: log-receiver
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+      - name: Container build and ingestion smoke test
+        # The Dockerfile is a documented deployment path; a broken build or a
+        # container that cannot ingest an event must fail CI.
+        working-directory: log-receiver
+        run: |
+          docker build -t log-receiver:ci .
+          docker run -d --name log-receiver -p 127.0.0.1:18080:8080 log-receiver:ci
+          for _ in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
+            sleep 0.5
+          done
+          curl -fsS -X POST -H 'content-type: application/json' \
+            -d "{\"sessionId\":\"ci-$GITHUB_RUN_ID\",\"sequence\":1,\"message\":\"ci smoke\"}" \
+            http://127.0.0.1:18080/events
+          curl -fsS http://127.0.0.1:18080/sessions | grep -q "ci-$GITHUB_RUN_ID"
+          docker rm -f log-receiver
+
+  vuln:
+    name: Vulnerability scan (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: log-receiver/go.mod
+          cache: false
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - name: Run govulncheck
+        working-directory: log-receiver
+        run: govulncheck ./...
+      - name: Note
+        run: |
+          echo "govulncheck fails the job only on vulnerabilities reachable from this code."
+          echo "Informational advisories in required-but-uncalled modules are reported in the log but do not fail CI."
+
+  scripts:
+    name: Renderer and shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Renderer tests
+        run: python3 scripts/test_render_setup.py
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: ShellCheck
+        run: |
+          shellcheck scripts/build-oneclick-windows.sh
+          bash -n scripts/build-oneclick-windows.sh
+
+  dashboard:
+    name: Log dashboard (browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Install Playwright test runtime
+        # The dashboard check is optional by design: it takes an external
+        # package.json so the receiver itself keeps zero runtime dependencies.
+        run: |
+          mkdir -p "$RUNNER_TEMP/dashboard"
+          cd "$RUNNER_TEMP/dashboard"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund -D @playwright/test
+          npx playwright install --with-deps chromium
+      - name: Dashboard checks
+        run: node scripts/test-dashboard.mjs "$RUNNER_TEMP/dashboard/package.json"
+
+  powershell:
+    name: PowerShell safety (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Parse every PowerShell file with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = @()
+          Get-ChildItem -Path payload, scripts -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $failed += ("{0}: {1}" -f $_.Name, $errors[0].Message)
+            }
+          }
+          if ($failed.Count -gt 0) {
+            $failed | ForEach-Object { Write-Host ("::error::" + $_) }
+            exit 1
+          }
+          Write-Host "All PowerShell files parse under 5.1."
+      - name: Safety fixtures
+        shell: powershell
+        run: ./scripts/test-safety.ps1
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

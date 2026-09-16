@@ -3,6 +3,14 @@
 最后本地核查：2026-09-13。代码内版本仍为 `1.0.0`，本轮为未发布的审计与交互
 加固改动；没有构建新的可分发 EXE，也没有覆盖桌面已有版本或修改线上日志服务。
 
+## CI
+
+`.github/workflows/ci.yml`（首个 workflow，2026-09-16 加入）在每次 push/PR 上运行：
+接收器 Go vet/race 测试 + 容器构建与摄取冒烟、renderer 测试与 ShellCheck、
+日志页浏览器检查、Windows PowerShell 5.1 解析与安全 fixtures、govulncheck、
+gitleaks 密钥扫描。需要私密配置与固定载荷的 IExpress 打包和 `--validate-only`
+自检仍在本地执行。
+
 ## 保持的产品框架
 
 - Windows x64 单文件 IExpress 分发，PowerShell 5.1 控制台运行。

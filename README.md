@@ -1,5 +1,7 @@
 # SSH-Launchpad OneClick（Remote-Onboarder）
 
+[![CI](https://github.com/Shallow-dusty/remote-onboarder/actions/workflows/ci.yml/badge.svg)](https://github.com/Shallow-dusty/remote-onboarder/actions/workflows/ci.yml)
+
 Windows x64 一键接入工具：把一台 Windows 机器配置好 OpenSSH、写入控制器公钥、
 关闭 SSH 密码/键盘交互认证、将 SSH 防火墙限制到 Tailscale 地址范围、
 安装 Tailscale 并用一次性密钥加入指定 Tailnet。全程终端实时显示进度，

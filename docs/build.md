@@ -160,6 +160,16 @@ reverse-proxy route: /ssh-launchpad-log/* -> container
 persisted data: /opt/ssh-launchpad-log/data/*.jsonl
 ```
 
+Build and run the container from `log-receiver/` (multi-stage build, no
+manually prepared binary):
+
+```bash
+cd log-receiver
+docker build -t log-receiver:local .
+docker run -d --name log-receiver -p 127.0.0.1:8080:8080 -v "$PWD/data:/data" log-receiver:local
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
 The receiver is a statically linked Go service with bounded request bodies,
 strict event decoding, append-and-sync persistence, health/session endpoints,
 and a small live browser view. Back up your reverse-proxy configuration before
@@ -184,10 +194,16 @@ trusted service operator.
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_render_setup.py
 shellcheck scripts/build-oneclick-windows.sh
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$PWD/scripts/test-safety.ps1")"
-(cd log-receiver && GO111MODULE=off go test -race && GO111MODULE=off go vet)
+(cd log-receiver && go test -race ./... && go vet ./...)
 # Optional: reuse an existing Playwright installation, without new runtime deps.
 node scripts/test-dashboard.mjs /absolute/path/to/playwright-project/package.json
 ```
+
+The same checks run on every push in `.github/workflows/ci.yml` (receiver
+tests plus a container smoke test, renderer and ShellCheck, the browser
+dashboard checks, PowerShell 5.1 parsing and the safety fixtures, govulncheck
+and a secret scan). Building the single-EXE and the `--validate-only` run still
+happen locally because they need a private config and pinned payloads.
 
 Use a synthetic 0600 build config and existing pinned payloads for
 `--validate-only`. Do not run `setup.ps1` without `-SelfTest` on a development
