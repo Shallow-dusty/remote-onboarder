@@ -2,7 +2,7 @@
 # build needs no manually prepared binary. The previous single-stage Dockerfile
 # copied "log-receiver" from a context that only contains the sources, so the
 # documented docker deployment could not build at all.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26.9-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY *.go dashboard.html ./
