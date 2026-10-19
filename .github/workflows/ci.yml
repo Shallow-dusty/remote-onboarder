@@ -78,7 +78,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Renderer tests
-        run: python3 scripts/test_render_setup.py
+        run: |
+          python3 scripts/test_render_setup.py
+          python3 scripts/test_build_portable.py
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
@@ -134,7 +136,10 @@ jobs:
           Write-Host "All PowerShell files parse under 5.1."
       - name: Safety fixtures
         shell: powershell
-        run: ./scripts/test-safety.ps1
+        run: |
+          ./scripts/test-safety.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./scripts/test-resilience.ps1
 
   secrets:
     name: Secret scan

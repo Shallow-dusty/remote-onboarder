@@ -11,7 +11,8 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$ToolVersion = '1.0.0'
+$ToolVersion = '1.2.1-migration-cloud'
+$CompatibilityMode = __COMPATIBILITY_MODE__
 $SshPort = 22
 $TailscaleRemoteAddress = '100.64.0.0/10'
 $TailscaleRemoteAddressNormalized = '100.64.0.0/255.192.0.0'
@@ -23,6 +24,7 @@ $OpenSshPayloadSHA256 = '__OPENSSH_SHA256__'
 $TailscalePayloadName = 'tailscale-setup-1.102.3-amd64.msi'
 $TailscalePayloadSHA256 = '__TAILSCALE_SHA256__'
 $LogEndpoints = __LOG_ENDPOINTS_JSON__
+$LogEndpointAddresses = __LOG_ENDPOINT_ADDRESSES__
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:Sequence = 0
@@ -36,7 +38,14 @@ $script:RecoveryPath = ''
 $script:MutationLock = $null
 $script:LockHeld = $false
 $script:NativeUncertain = $false
+$script:TailscaleIP = ''
+$script:LastFailure = ''
+$script:RebootRequired = $false
+$script:DiagnosticJobs = @()
+$script:DiagnosticIssues = New-Object System.Collections.Generic.List[object]
+$script:CompatibilityWarnings = New-Object System.Collections.Generic.List[string]
 . (Join-Path $PSScriptRoot 'safety.ps1')
+. (Join-Path $PSScriptRoot 'diagnostics.ps1')
 
 function Get-SafeName([string]$Value) {
     $safe = $Value -replace '[^A-Za-z0-9._-]', '-'
@@ -68,9 +77,10 @@ function Invoke-Upload([string]$Json) {
     }
     $body = $Utf8NoBom.GetBytes($Json)
     foreach ($endpoint in $ordered) {
+        # Private log gateway cannot be reached before this device joins Tailnet.
+        if (([uri]$endpoint).Host.EndsWith('.ts.net') -and -not $script:TailscaleIP) { continue }
         try {
-            Invoke-RestMethod -Method Post -Uri $endpoint -ContentType 'application/json; charset=utf-8' `
-                -Body $body -TimeoutSec 4 -MaximumRedirection 0 -UseBasicParsing | Out-Null
+            Invoke-LogRequest -Method 'POST' -Uri $endpoint -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSeconds 4 | Out-Null
             $script:ActiveEndpoint = $endpoint
             return $true
         } catch { }
@@ -340,10 +350,46 @@ function Get-TargetDesktop {
     return $TargetProfile
 }
 
+function Get-SshConnectionInfo([string]$UserName, [string]$Address, [string]$ComputerName) {
+    $safeUser = $UserName.Replace('"', '')
+    if ($UserName -match '^[\x20-\x7E]+$') {
+        return [pscustomobject]@{
+            Command = ('ssh -l "{0}" {1}' -f $safeUser, $Address)
+            Config = ''
+        }
+    }
+    $alias = 'friend-' + (($ComputerName.ToLowerInvariant() -replace '[^a-z0-9-]', '').Trim('-'))
+    if ($alias -eq 'friend' -or $alias -eq 'friend-') { $alias = 'friend-migration' }
+    $config = @(
+        ('Host {0}' -f $alias),
+        ('    HostName {0}' -f $Address),
+        ('    User {0}' -f $UserName)
+    ) -join "`r`n"
+    return [pscustomobject]@{
+        Command = ('ssh {0}' -f $alias)
+        Config = $config
+    }
+}
+
 function Get-OpenSshInstallDecision([bool]$ServiceExists, [bool]$BinaryExists) {
     if (-not $ServiceExists) { return 'install' }
     if (-not $BinaryExists) { return 'repair' }
     return 'skip'
+}
+
+function Invoke-MsiInstall([string]$Arguments, [string]$DisplayName) {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $result = Invoke-NativeProcess -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -Arguments $Arguments -DisplayName $DisplayName -TimeoutSeconds 600 -SuccessCodes @(0,1641,3010,1618) -QuietOutput
+        if ($result.ExitCode -ne 1618) {
+            if ($result.ExitCode -in @(1641,3010)) {
+                $script:RebootRequired = $true
+                Write-SetupEvent WARN '安装器提示需要重启；先检查当前服务能否继续，最终状态会记录重启需求'
+            }
+            return $result
+        }
+        if ($attempt -lt 3) { Write-SetupEvent WARN 'Windows Installer 正忙，10 秒后自动重试'; Start-Sleep -Seconds 10 }
+    }
+    throw 'Windows Installer 持续繁忙；请等其他安装完成后再运行，本次没有并行启动第二个安装器'
 }
 
 function Install-OpenSSH([string]$MsiPath) {
@@ -361,8 +407,7 @@ function Install-OpenSSH([string]$MsiPath) {
         $msiLog = Join-Path $LogRoot ($script:SessionId + '-openssh-msi.log')
         $args = '/i "{0}" ADDLOCAL=Client,Server /qn /norestart /L*v "{1}"' -f $MsiPath, $msiLog
         if ($decision -eq 'repair') { $args += ' REINSTALL=ALL REINSTALLMODE=vomus' }
-        [void](Invoke-NativeProcess -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
-            -Arguments $args -DisplayName '安装 Microsoft Win32-OpenSSH' -TimeoutSeconds 600 -SuccessCodes @(0,1641,3010) -QuietOutput)
+        [void](Invoke-MsiInstall -Arguments $args -DisplayName '安装 Microsoft Win32-OpenSSH')
         $service = Get-Service sshd -ErrorAction SilentlyContinue
     } else {
         Write-SetupEvent OK '检测到 sshd 服务与 sshd.exe，跳过重复安装'
@@ -437,6 +482,8 @@ function Configure-OpenSSH {
         $service = Get-Service sshd
         if ($service.Status -eq 'Running') { Restart-Service sshd -Force } else { Start-Service sshd }
         $service = Get-Service sshd
+        $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(20))
+        $service.Refresh()
         if ($service.Status -ne 'Running') { throw "sshd 当前状态=$($service.Status)" }
     } catch {
         Copy-Item -LiteralPath $backupPath -Destination $configPath -Force
@@ -456,7 +503,8 @@ function Configure-Firewall {
             -RemoteAddress $TailscaleRemoteAddress -Action Allow -Profile Any | Out-Null
     }
     if (@(Get-UnsafeSshRules).Count -gt 0) { throw '仍有宽放行规则，停止配置' }
-    Write-SetupEvent OK ("TCP 22 仅允许 Tailscale 地址范围：$TailscaleRemoteAddress")
+    Write-SetupEvent OK ("本工具的 TCP 22 规则已限制到 Tailscale 地址范围：$TailscaleRemoteAddress")
+    if ($CompatibilityMode -and $script:CompatibilityWarnings.Count) { Write-SetupEvent WARN '迁移兼容模式保留了既有网络策略，不保证整台电脑只有这一条放行规则' }
 }
 
 function Install-Tailscale([string]$MsiPath) {
@@ -465,8 +513,7 @@ function Install-Tailscale([string]$MsiPath) {
     if (-not $tailscale) {
         $msiLog = Join-Path $LogRoot ($script:SessionId + '-tailscale-msi.log')
         $args = '/i "{0}" /qn /norestart /L*v "{1}" TS_ALLOWINCOMINGCONNECTIONS=always' -f $MsiPath, $msiLog
-        [void](Invoke-NativeProcess -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') `
-            -Arguments $args -DisplayName '安装 Tailscale' -TimeoutSeconds 600 -SuccessCodes @(0,1641,3010) -QuietOutput)
+        [void](Invoke-MsiInstall -Arguments $args -DisplayName '安装 Tailscale')
         for ($i = 0; $i -lt 30 -and -not $tailscale; $i++) {
             Start-Sleep -Seconds 2
             $tailscale = Find-TailscaleExe
@@ -476,7 +523,11 @@ function Install-Tailscale([string]$MsiPath) {
     }
     if (-not $tailscale) { throw 'Tailscale 安装结束后仍找不到 tailscale.exe；请重启 Windows 后重新运行本工具' }
     $service = Get-Service Tailscale -ErrorAction SilentlyContinue
-    if ($service -and $service.Status -ne 'Running') { Start-Service Tailscale }
+    if ($service) {
+        if ($service.Status -ne 'Running') { Start-Service Tailscale }
+        $service = Get-Service Tailscale
+        $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(30))
+    }
     Write-SetupEvent OK 'Tailscale 程序可用'
     return $tailscale
 }
@@ -495,8 +546,10 @@ function Connect-Tailscale([string]$TailscaleExe) {
         throw '无法读取 Tailscale 状态，未尝试重新登录；请检查客户端后重试'
     }
 
-    $currentTailnet = if ($state -eq 'Running') { Get-TailnetIdentity $status } else { '' }
-    if ($state -eq 'Running' -and $currentTailnet -eq $ExpectedTailnet) {
+    $currentTailnet = if ($state -in @('Running','Stopped')) { Get-TailnetIdentity $status } else { '' }
+    if ($state -eq 'Stopped' -and $currentTailnet -eq $ExpectedTailnet) {
+        [void](Invoke-NativeProcess -FilePath $TailscaleExe -Arguments 'up --timeout=60s' -DisplayName '恢复已确认的目标 Tailnet（不重新使用入网密钥）' -TimeoutSeconds 90 -QuietOutput)
+    } elseif ($state -eq 'Running' -and $currentTailnet -eq $ExpectedTailnet) {
         Write-SetupEvent OK ("设备已在目标 Tailnet 在线：$ExpectedTailnet，跳过重复登录")
     } else {
         if ($state -notin @('NeedsLogin', 'NoState')) {
@@ -551,18 +604,38 @@ function Verify-Result([string]$TailscaleIP) {
     if (@($effective.StdOut -split '\r?\n' | Where-Object { $_ -match '^port ' }).Count -ne 1) { throw '检测到额外 SSH 端口' }
     Write-SetupEvent OK '本机检查通过；仍需控制电脑实际连接验证，不能据此证明远端可达'
 
-    $sshCommand = 'ssh {0}@{1}' -f $TargetUser, $TailscaleIP
-    $result = @(
+    $connection = Get-SshConnectionInfo $TargetUser $TailscaleIP $env:COMPUTERNAME
+    $sshCommand = $connection.Command
+    $fingerprints = New-Object System.Collections.Generic.List[string]
+    $keygen = Find-SshBinary 'ssh-keygen.exe'
+    foreach ($hostKey in @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'ssh') -Filter 'ssh_host_*_key.pub' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $fp = Invoke-NativeProcess -FilePath $keygen -Arguments ('-lf "{0}" -E sha256' -f $hostKey.FullName) -DisplayName '读取主机公钥指纹' -TimeoutSeconds 10 -QuietOutput
+            $fingerprints.Add($fp.StdOut)
+        } catch { Write-SetupEvent WARN '无法读取一项主机公钥指纹，详见诊断报告' }
+    }
+    $configLines = @()
+    if ($connection.Config) {
+        $configLines = @(
+            '中文用户名不能直接写在 SSH 命令行；请在控制端 ~/.ssh/config 加入：',
+            $connection.Config,
+            '保存后执行上面的 ssh 命令；IdentityFile 由控制端按自己的密钥补充。'
+        )
+    }
+    $result = (@(
         'SSH Launchpad 本机配置检查通过（等待控制电脑试连）',
         ('时间：{0}' -f (Get-Date)),
         ('目标用户名：{0}' -f $TargetUser),
         ('主机名：{0}' -f $env:COMPUTERNAME),
         ('Tailscale IP：{0}' -f $TailscaleIP),
-        ('连接命令：{0}' -f $sshCommand),
-        '首次连接请核对 SSH 主机指纹。此文件不含私钥或登录密钥。',
+        ('连接命令：{0}' -f $sshCommand)
+    ) + $configLines + @(
+        '首次连接请核对下列 SSH 主机指纹。此文件不含私钥或登录密钥。',
+        ($fingerprints -join "`r`n"),
+        ('迁移兼容模式：{0}；安装器要求重启：{1}' -f $CompatibilityMode,$script:RebootRequired),
         ('本机日志：{0}' -f $script:TextLog),
         ('会话编号：{0}' -f $script:SessionId)
-    ) -join "`r`n"
+    )) -join "`r`n"
     $desktop = Get-TargetDesktop
     $resultPath = Join-Path $desktop 'SSH-连接信息.txt'
     [IO.File]::WriteAllText($resultPath, $result + "`r`n", (New-Object Text.UTF8Encoding($true)))
@@ -573,6 +646,9 @@ function Verify-Result([string]$TailscaleIP) {
     Write-Host ('Tailscale IP : {0}' -f $TailscaleIP) -ForegroundColor Green
     Write-Host ('Windows 用户 : {0}' -f $TargetUser) -ForegroundColor Green
     Write-Host ('连接命令      : {0}' -f $sshCommand) -ForegroundColor Yellow
+    if ($connection.Config) {
+        Write-Host '中文用户名：命令行方式不可用，请按 SSH-连接信息.txt 里的 Host 段配置。' -ForegroundColor Yellow
+    }
     Write-Host '下一步：把「SSH-连接信息.txt」发给协助者，让对方实际试连。' -ForegroundColor Cyan
 }
 
@@ -638,6 +714,10 @@ try {
     Write-Host '这台电脑将允许控制者通过公钥连接；请保持窗口打开，完成后把连接信息发给协助者。'
     Write-Host '软件安装和登录不能完全撤销；出错时请保留日志，不要重复运行。' -ForegroundColor Yellow
     Write-SetupEvent INFO ("程序启动；目标用户=$TargetUser；目标目录=$TargetProfile")
+    if (-not $SelfTest) {
+        $script:DiagnosticJobs = @(Start-OnboardDiagnostics)
+        if ($CompatibilityMode) { Write-SetupEvent WARN '迁移兼容模式：保留陌生防火墙规则，仅配置本次 SSH 规则；不保证全机仅对 Tailnet 开放' }
+    }
 
     if ($SelfTest) {
         Invoke-SelfTest
@@ -672,25 +752,11 @@ try {
         Assert-Payload $openSshMsi $OpenSshPayloadSHA256
         Assert-Payload $tailscaleMsi $TailscalePayloadSHA256
 
-        # Reject unsupported existing policy before touching services.
-        $existingConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
-        Assert-NoReparsePath $existingConfig
-        if (Test-Path -LiteralPath $existingConfig) { Assert-SimpleSshPolicy ([IO.File]::ReadAllText($existingConfig)) }
-        [void]@(Get-UnsafeSshRules)
-        $tailscale = Install-Tailscale $tailscaleMsi
-        $tailscaleIP = Connect-Tailscale $tailscale
-        Install-OpenSSH $openSshMsi
-        Save-RecoverySnapshot
-        Configure-Firewall
-        Configure-OpenSSH
-        Verify-Result $tailscaleIP
-        Remove-Item -LiteralPath (Join-Path $StateRoot 'recovery-pending.txt') -Force -ErrorAction Stop
-        $script:Success = $true
-        $script:ExitCode = 0
-        Remove-Item -LiteralPath $PayloadRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Invoke-OnboardingFlow -OpenSshMsi $openSshMsi -TailscaleMsi $tailscaleMsi
     }
 } catch {
     $failure = Protect-SetupText $_.Exception.Message
+    $script:LastFailure = $failure
     try { Write-SetupEvent ERROR $failure } catch { Write-Host $failure -ForegroundColor Red }
     if (-not $SelfTest -and $script:Recovery -and -not $script:NativeUncertain) {
         try { Restore-RecoverySnapshot } catch { Write-Host ('自动恢复未完成：' + (Protect-SetupText $_.Exception.Message)) -ForegroundColor Red }
@@ -705,12 +771,16 @@ try {
     if ($script:MutationLock) { $script:MutationLock.Dispose() }
     try { Flush-UploadQueue -Force } catch { }
     if (-not $SelfTest) {
+        try { Export-OnboardReport } catch { Write-Host ('诊断导出失败：' + (Protect-SetupText $_.Exception.Message)) -ForegroundColor Yellow }
         try {
             $desktop = Get-TargetDesktop
             if ($desktop -and (Test-Path -LiteralPath $script:TextLog)) {
                 Copy-Item -LiteralPath $script:TextLog -Destination (Join-Path $desktop 'SSH-安装日志.log') -Force
             }
         } catch { }
+    }
+    if (-not $SelfTest) {
+        try { Send-OnboardArtifacts } catch { Write-Host ('云日志未全部上传，本地文件保留：' + (Protect-SetupText $_.Exception.Message)) -ForegroundColor Yellow }
     }
     if ($SelfTest -and (Test-Path -LiteralPath $StateRoot)) { Remove-Item -LiteralPath $StateRoot -Recurse -Force }
     if (-not $NoPause) {

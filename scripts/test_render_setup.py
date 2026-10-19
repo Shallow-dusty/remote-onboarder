@@ -35,6 +35,23 @@ class RenderTests(unittest.TestCase):
                 with self.assertRaises(ValueError): self.render()
                 self.config[field] = original
 
+    def test_compatibility_mode_is_explicit_and_typed(self):
+        self.assertIn('$CompatibilityMode = $false', self.render())
+        self.config['compatibilityMode'] = True
+        self.assertIn('$CompatibilityMode = $true', self.render())
+        for invalid in ['true', 1, None]:
+            self.config['compatibilityMode'] = invalid
+            with self.assertRaises(ValueError):
+                self.render()
+
+    def test_private_log_dns_override(self):
+        self.config['logEndpointAddresses'] = {'example.tail123.ts.net': '100.84.225.38'}
+        self.assertIn("'example.tail123.ts.net'='100.84.225.38'", self.render())
+        for mapping in [{'example.com': '100.84.225.38'}, {'example.ts.net': '8.8.8.8'}, []]:
+            self.config['logEndpointAddresses'] = mapping
+            with self.assertRaises(ValueError):
+                self.render()
+
     def test_markers_are_not_reinterpreted_in_input(self):
         self.config['publicKey'] += ' __EXPECTED_TAILNET__'
         self.assertIn('test __EXPECTED_TAILNET__', self.render())

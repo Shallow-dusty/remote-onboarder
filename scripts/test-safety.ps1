@@ -30,12 +30,22 @@ MustReject { Test-PortIncludesSSH 'RPC' }
 function Get-NetFirewallProfile { @('Domain','Private','Public') | ForEach-Object { [pscustomobject]@{ Enabled='True'; DefaultInboundAction='Block' } } }
 $script:Rules=@()
 function Get-NetFirewallRule { $script:Rules }
-function Get-NetFirewallApplicationFilter { process { [pscustomobject]@{Program='Any'} } }
+$script:PackageScope='Any'
+function Get-NetFirewallApplicationFilter { process { [pscustomobject]@{Program='Any';Package=$script:PackageScope} } }
 function Get-NetFirewallServiceFilter { process { [pscustomobject]@{Service='Any'} } }
 function Get-NetFirewallPortFilter { process { [pscustomobject]@{ Protocol=$_.Protocol; LocalPort=$_.LocalPort } } }
 function Get-NetFirewallAddressFilter { process { [pscustomobject]@{ RemoteAddress=@($_.Scope) } } }
 $script:Rules=@([pscustomobject]@{Name='foreign';Protocol='Any';LocalPort='Any';Scope='Any';PolicyStoreSourceType='Local'})
 MustReject { Get-UnsafeSshRules }
+# Packaged Windows components may have Program/Port=Any, but only for their
+# AppContainer SID. Do not disable them or mistake them for Win32 sshd rules.
+$script:PackageScope='S-1-15-2-123-456-789'
+Assert (@(Get-UnsafeSshRules).Count -eq 0) 'package-only rule misclassified as SSH'
+foreach ($scope in @('Any','', 'unrecognized-package', 'S-1-15-2-invalid')) {
+    $script:PackageScope=$scope
+    MustReject { Get-UnsafeSshRules }
+}
+$script:PackageScope='Any'
 $script:Rules=@([pscustomobject]@{Name='OpenSSH-Server-In-TCP';Protocol='TCP';LocalPort='22';Scope='Any';PolicyStoreSourceType='Local'})
 Assert (@(Get-UnsafeSshRules).Count -eq 1) 'stock broad rule not identified'
 $script:Rules[0].Scope='100.64.0.0/10'

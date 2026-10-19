@@ -8,10 +8,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $setup = Join-Path $PSScriptRoot 'setup.ps1'
-if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
-    Write-Host "Missing setup script: $setup" -ForegroundColor Red
-    Read-Host 'Press Enter to close' | Out-Null
-    exit 1
+$powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+foreach ($required in @('setup.ps1','safety.ps1','diagnostics.ps1')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $required) -PathType Leaf)) {
+        Write-Host ('Missing file: '+$required+'. Extract the complete ZIP / copy ALL update files into the original folder.') -ForegroundColor Red
+        if (-not $SelfTest) { Read-Host 'Press Enter to close' | Out-Null }
+        exit 1
+    }
 }
 
 try {
@@ -25,13 +28,15 @@ try {
     )
     if ($SelfTest) {
         $arguments += @('-SelfTest', '-NoPause')
-        $process = Start-Process -FilePath 'powershell.exe' -ArgumentList ($arguments -join ' ') -Wait -PassThru -NoNewWindow
+        $process = Start-Process -FilePath $powershell -ArgumentList ($arguments -join ' ') -Wait -PassThru -NoNewWindow
     } else {
-        $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ($arguments -join ' ') -Wait -PassThru
+        $process = Start-Process -FilePath $powershell -Verb RunAs -ArgumentList ($arguments -join ' ') -Wait -PassThru
     }
     exit $process.ExitCode
 } catch {
-    Write-Host ("Administrator launch failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
-    Read-Host 'Press Enter to close' | Out-Null
+    $message = "Administrator launch failed or was cancelled: $($_.Exception.Message)"
+    Write-Host $message -ForegroundColor Red
+    try { [IO.File]::WriteAllText((Join-Path ([Environment]::GetFolderPath('Desktop')) 'SSH-launch-error.txt'), $message, (New-Object Text.UTF8Encoding($true))) } catch { }
+    if (-not $SelfTest) { Read-Host 'Press Enter to close' | Out-Null }
     exit 1
 }

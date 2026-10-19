@@ -13,6 +13,18 @@ def render(source, config, openssh_sha, tailscale_sha):
     key = config.get('publicKey', '').strip()
     tailnet = config.get('expectedTailnet', '').lower().rstrip('.')
     endpoints = config.get('logEndpoints', [])
+    addresses = config.get('logEndpointAddresses', {})
+    if not isinstance(addresses, dict):
+        raise ValueError('logEndpointAddresses must be a map')
+    import ipaddress
+    for host, address in addresses.items():
+        if not isinstance(host, str) or not re.fullmatch(r'[a-z0-9.-]+\.ts\.net', host):
+            raise ValueError('log address override requires a Tailnet hostname')
+        if ipaddress.ip_address(address) not in ipaddress.ip_network('100.64.0.0/10'):
+            raise ValueError('log address override requires a Tailnet IPv4 address')
+    compatibility = config.get('compatibilityMode', False)
+    if not isinstance(compatibility, bool):
+        raise ValueError('compatibilityMode must be a boolean')
     if not isinstance(auth, str) or not re.fullmatch(r'tskey-auth-[A-Za-z0-9-]{20,}', auth):
         raise ValueError('invalid tailscaleAuthKey')
     parts = key.split()
@@ -44,6 +56,8 @@ def render(source, config, openssh_sha, tailscale_sha):
     values = {
         '__TAILSCALE_AUTH_KEY__': literal(auth), '__SSH_PUBLIC_KEY__': literal(key),
         '__EXPECTED_TAILNET__': literal(tailnet), '__OPENSSH_SHA256__': openssh_sha,
+        '__COMPATIBILITY_MODE__': '$true' if compatibility else '$false',
+        '__LOG_ENDPOINT_ADDRESSES__': '@{' + '; '.join("'" + h + "'='" + a + "'" for h, a in addresses.items()) + '}',
         '__TAILSCALE_SHA256__': tailscale_sha,
         '__LOG_ENDPOINTS_JSON__': '@(' + ', '.join("'" + literal(e) + "'" for e in endpoints) + ')',
     }
@@ -58,6 +72,7 @@ if __name__ == '__main__':
     source, config, output, ssh_hash, ts_hash = sys.argv[1:]
     try:
         result = render(Path(source).read_text(encoding='utf-8-sig'), json.loads(Path(config).read_text()), ssh_hash, ts_hash)
-        Path(output).write_text(result, encoding='utf-8-sig', newline='\r\n')
+        with Path(output).open('w', encoding='utf-8-sig', newline='\r\n') as stream:
+            stream.write(result)
     except (ValueError, TypeError) as exc:
         sys.exit(str(exc))

@@ -62,13 +62,51 @@ function Test-PortIncludesSSH([string]$Ports) {
     return $false
 }
 
+function Get-OnboardProperty($Object, [string]$Name, $Default = '') {
+    if ($null -eq $Object) { return $Default }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $Default
+}
+
+function Test-CompatibilityMode {
+    $setting = Get-Variable -Name CompatibilityMode -ErrorAction SilentlyContinue
+    return ($null -ne $setting -and $setting.Value -eq $true)
+}
+
+function Write-CompatibilityWarning([string]$Message) {
+    $warningList = Get-Variable -Name CompatibilityWarnings -Scope Script -ErrorAction SilentlyContinue
+    if ($warningList) {
+        if ($warningList.Value.Contains($Message)) { return }
+        [void]$warningList.Value.Add($Message)
+    }
+    if (Get-Command Write-SetupEvent -ErrorAction SilentlyContinue) { Write-SetupEvent WARN $Message firewall }
+    else { Write-Warning $Message }
+}
+
 function Get-UnsafeSshRules {
     $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
-    if ($profiles.Count -ne 3 -or @($profiles | Where-Object { [string]$_.Enabled -ne 'True' -or [string]$_.DefaultInboundAction -ne 'Block' }).Count) { throw 'Windows 防火墙必须启用且所有配置文件默认阻止入站' }
-    foreach ($rule in @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound -Enabled True -Action Allow -ErrorAction Stop)) {
+    if ($profiles.Count -ne 3 -or @($profiles | Where-Object { [string]$_.Enabled -ne 'True' -or [string]$_.DefaultInboundAction -ne 'Block' }).Count) {
+        if (-not (Test-CompatibilityMode)) { throw 'Windows 防火墙必须启用且所有配置文件默认阻止入站' }
+        Write-CompatibilityWarning '迁移兼容模式：保留现有防火墙配置；它不满足全配置文件默认阻止入站条件，不能保证全机仅对 Tailnet 开放'
+    }
+    if (Test-CompatibilityMode) {
+        # Migration mode owns only conventional SSH rules. Full inventory is a
+        # separate bounded diagnostic job, never a repeated blocking install gate.
+        Write-CompatibilityWarning '迁移兼容模式：主流程只处理已知 OpenSSH 规则；陌生规则保持不变，完整清单由后台诊断采集，不保证全机仅对 Tailnet 开放'
+        $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name 'OpenSSH-Server-In-TCP','sshd' -ErrorAction SilentlyContinue | Where-Object { [string]$_.Direction -eq 'Inbound' -and [string]$_.Enabled -eq 'True' -and [string]$_.Action -eq 'Allow' })
+    } else {
+        $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound -Enabled True -Action Allow -ErrorAction Stop)
+    }
+    foreach ($rule in $rules) {
         $application = @($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
         $service = @($rule | Get-NetFirewallServiceFilter -ErrorAction Stop)
         if ($application.Count -ne 1 -or $service.Count -ne 1) { throw '防火墙程序/服务证据不完整' }
+        # AppContainer package-scoped rules do not apply to the ordinary Win32
+        # sshd service, even when their Program/LocalPort display as Any.
+        # Only recognize concrete package SIDs; unknown scopes remain checked.
+        $packageProperty = $application[0].PSObject.Properties['Package']
+        if ($packageProperty -and [string]$packageProperty.Value -match '^S-1-15-2-(?:\d+-)*\d+$') { continue }
         $program = [Environment]::ExpandEnvironmentVariables([string]$application[0].Program)
         if ($program -and $program -ne 'Any' -and [IO.Path]::GetFileName($program) -ine 'sshd.exe') { continue }
         if ($service[0].Service -and [string]$service[0].Service -notin @('Any','sshd')) { continue }
@@ -76,7 +114,13 @@ function Get-UnsafeSshRules {
         if ($port.Count -ne 1) { throw '防火墙端口证据不完整' }
         $protocol = [string]$port[0].Protocol
         if ($protocol -notin @('TCP', '6', 'Any', '256')) { continue }
-        if (-not (Test-PortIncludesSSH ([string]::Join(',', @($port[0].LocalPort))))) { continue }
+        try { $includesSsh = Test-PortIncludesSSH ([string]::Join(',', @($port[0].LocalPort))) }
+        catch {
+            if (-not (Test-CompatibilityMode)) { throw }
+            Write-CompatibilityWarning ('迁移兼容模式：保留端口条件无法解析的规则 ' + $rule.Name + ' (' + (Get-OnboardProperty $rule 'DisplayName') + ')')
+            continue
+        }
+        if (-not $includesSsh) { continue }
         $addresses = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
         if ($addresses.Count -ne 1) { throw '防火墙地址证据不完整' }
         $scopes = @($addresses[0].RemoteAddress)
@@ -84,7 +128,12 @@ function Get-UnsafeSshRules {
         # Only conventional OpenSSH TCP-22 rules may be disabled automatically.
         # Any-protocol, range, GPO or unfamiliar rules need manual review.
         if ($rule.Name -notin @('OpenSSH-Server-In-TCP','sshd') -or $protocol -notin @('TCP','6') -or [string]$port[0].LocalPort -ne '22' -or [string]$rule.PolicyStoreSourceType -ne 'Local') {
-            throw ('存在额外放行 SSH 的规则，需人工检查：' + $rule.Name)
+            $detail = 'Name={0}; DisplayName={1}; Program={2}; Service={3}; Protocol={4}; LocalPort={5}; RemoteAddress={6}; Source={7}' -f $rule.Name, (Get-OnboardProperty $rule 'DisplayName'), $program, $service[0].Service, $protocol, ([string]::Join(',', @($port[0].LocalPort))), ([string]::Join(',', $scopes)), $rule.PolicyStoreSourceType
+            if (Test-CompatibilityMode) {
+                Write-CompatibilityWarning ('迁移兼容模式：保留陌生规则，不自动禁用；可能存在额外 SSH 访问范围。' + $detail)
+                continue
+            }
+            throw ('存在额外放行 SSH 的规则，需人工检查：' + $detail)
         }
         $rule
     }

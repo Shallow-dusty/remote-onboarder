@@ -1,5 +1,25 @@
 # SSH-Launchpad OneClick（Remote-Onboarder）
 
+## 连接信息修复（1.2.1-migration-cloud，源码候选）
+
+中文用户名不再输出不可用的命令行连接方式。ASCII 用户名保留 `ssh -l`；含非 ASCII 字符时，`SSH-连接信息.txt` 改为输出控制端 `~/.ssh/config` 的 Host 段，避免 OpenSSH 的 `remote username contains invalid characters`。此修复已通过 PowerShell 7/macOS 解析与 49 项健壮性断言，**尚未在 Windows PowerShell 5.1 与新构建包上复验**。
+
+## 云日志迁移版（1.2.0-migration-cloud，已实跑一次）
+
+启用 `logEndpoints` 后，入网前事件留在本地，入网后补传；结束时另行上传完整运行日志、事件、诊断、MSI 日志及连接信息，以字节数和 SHA-256 回执确认。上传前脱敏，不采集个人迁移文件。单文件上限 32 MiB，超过或上传失败明确报告并保留本地，不静默截断。需要朋友知悉日志上传用途。
+
+可选 `logEndpointAddresses` 为 Tailnet 域名到 100.64.0.0/10 IPv4 的映射，使用 Windows curl `--resolve` 避免 MagicDNS 差异，仍校验 HTTPS 域名证书，不修改系统 DNS。默认 `{}`；接收端必须部署包含 `/artifacts/` API 的新版本且仅私网访问。
+
+2026-10-10 已在朋友 Windows 11 中文账户（`LAPTOP-RNN171NI`）完成 7/7 步实际接入；Tailscale 入网、SSH 公钥登录和云日志均验证。中文用户名必须使用 SSH config 的 `User` 字段，不能直接写在命令行。
+
+## 迁移协助版（1.1.0-migration，本地候选）
+
+构建配置可显式设置 `"compatibilityMode": true`：保留陌生防火墙规则并继续接入，不关闭/重置防火墙；本工具新增规则仍限制到 Tailscale 地址范围，但**不保证整台电脑只有 Tailnet 可访问 SSH**。默认 `false` 保留严格检查。
+
+独立只读诊断并行、安装和系统改动串行；Windows Installer 忙时最多尝试三次。失败自动生成桌面 `SSH-反馈资料.zip`（诊断、状态、脱敏日志和安装器日志尾部），接收方不必输入排查命令。无法修复的错误仍明确报告，不假报成功。
+
+支持无 IExpress/7z 的 ZIP 与小脚本更新包，见 `docs/build.md`。已有 SSH 策略不支持时可以先完成 Tailscale 接入，但不代表 SSH 已可用。1.2.0 已在真实 Windows 11 中文账户完成一次 7/7 步端到端接入（2026-10-10）；隔离 VM、UAC 与断电恢复仍未验收。
+
 [![CI](https://github.com/Shallow-dusty/remote-onboarder/actions/workflows/ci.yml/badge.svg)](https://github.com/Shallow-dusty/remote-onboarder/actions/workflows/ci.yml)
 
 Windows x64 一键接入工具：把一台 Windows 机器配置好 OpenSSH、写入控制器公钥、
@@ -13,10 +33,12 @@ Windows x64 一键接入工具：把一台 Windows 机器配置好 OpenSSH、写
 会在受支持的 MSI 路径上尝试修复；系统 capability 或陌生路径交由原安装方式处理，不先删除服务。
 
 这是 [SSH-Launchpad](https://github.com/Shallow-dusty/ssh-launchpad)
-（跨平台 GUI 引导工具）的极简 Windows 单文件产品线：不需要 WebView2 运行时、
-不需要解压 ZIP，接收方拿到手的只是一个 EXE。
+（跨平台 GUI 引导工具）的极简 Windows 单文件产品线：不需要 WebView2 运行时。
+当前实际分发是无 IExpress/7z 的 ZIP（完整包或脚本更新包）；IExpress 单文件 EXE 路径仍保留，但本轮未生成。
 
-> 本轮审计改动尚未发布；代码内版本仍为 1.0.0。没有覆盖已有桌面 EXE。
+macOS 接入目前是本地产物，未纳入源码树、CI 或本构建流程；不要与 Windows 包混用。
+
+> 源码版本：`1.2.1-migration-cloud`。1.2.0 已在真实 Windows 11 中文账户完成 7/7 步接入；1.2.1 的连接信息修复尚待 Windows 复验。
 > 已验证与未验证的范围见 [STATUS](STATUS.md)。
 
 ## 安全模型
@@ -26,17 +48,18 @@ Windows x64 一键接入工具：把一台 Windows 机器配置好 OpenSSH、写
 - **密钥只在构建时注入**：Tailscale 一次性 key 与控制器公钥保存在本地
   `build/oneclick/private-config.json`（0600，gitignore），仓库里只有模板占位符
 - **载荷签名校验**：构建时校验 Microsoft / Tailscale 官方 Authenticode 签名与 SHA-256
-- 接收方操作只需：双击 EXE → UAC 点「是」→ 等完成 → 把桌面的
+- **中文用户名**：控制端不能使用 `ssh 用户@主机` 或 `ssh -l 用户`；请使用 `SSH-连接信息.txt` 中的 `~/.ssh/config` Host 段，并补上 `IdentityFile`
+- 接收方操作只需：双击 `launcher.cmd`（或 EXE，视分发包）→ UAC 点「是」→ 等完成 → 把桌面的
   `SSH-连接信息.txt` 发回来
 
 ## 目录结构
 
 ```text
-payload/                 内嵌进 SFX 的脚本（模板，未含任何密钥）
+payload/                 内嵌进分发包的脚本（模板，未含任何密钥）
   setup.ps1              主脚本：预检/安装/配置/接入/验证/日志上传
   safety.ps1             策略检查、凭据脱敏、恢复快照与路径保护
   bootstrap.ps1          提权包装器
-  launcher.cmd           SFX 入口
+  launcher.cmd           启动入口
 log-receiver/            可自建的实时日志接收器（Go，静态单文件 + Docker）
 scripts/
   build-oneclick-windows.sh   WSL 构建脚本：下载固定版 MSI → 注入私密配置 →

@@ -70,6 +70,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/events", s.handleEvents)
+	mux.HandleFunc("/artifacts/", s.handleArtifacts)
 	mux.HandleFunc("/sessions", s.handleSessions)
 	mux.HandleFunc("/sessions/", s.handleSession)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,83 @@
 # Windows one-click onboarding package
 
+## 1.2 private cloud logs
+
+Optional `logEndpointAddresses` maps a `.ts.net` hostname to a Tailnet IPv4
+address. Windows curl `--resolve` connects to that address with normal hostname
+certificate verification, no redirect following or system DNS edits. Default `{}`
+uses Invoke-RestMethod. Only the log receiver connection uses this override.
+
+Full UTF-8 redacted artifacts are PUT to the endpoint base path plus
+`/artifacts/<sessionId>/<name>`; GET retrieves them. Allowed names are setup.log,
+events.jsonl, diagnostics.json, openssh-msi.log, tailscale-msi.log, connection.txt,
+and upload-status.json. Client currently writes upload-status locally; all other
+existing listed files are uploaded. MSI logs are read in full, BOM-aware, not the
+100-line diagnostic tail. Server acknowledgement includes bytes and SHA-256.
+
+Limits: 32 MiB per artifact, 512 MiB artifact storage, 1000 artifact sessions;
+size/quota failure is explicit, never silent truncation. Client whole-file upload
+budget is 120 seconds with at most two attempts per endpoint/file. Local logs are
+not deleted on failure. No background retry service is installed: if initial
+Tailnet enrollment fails, use the local feedback ZIP; restarting a completed run
+is not an automatic upload-only recovery mechanism. Logs contain device/user
+information; share this behavior with the recipient.
+
+The endpoint has no separate application login; expose only through authorized
+Tailnet networking, not Funnel or an unprotected public reverse proxy. Event
+stream UI remains separate from raw artifact downloads.
+
+
+## Migration candidate: portable ZIP and diagnostics
+
+Optional build input `compatibilityMode` is a boolean, default false. Set true
+only for an explicitly approved migration session: unknown firewall rules are
+preserved, the installer inventories them in a bounded background diagnostic job,
+and only conventional OpenSSH rules are handled by its foreground path. The
+managed rule remains Tailnet-scoped; whole-host Tailnet-only exposure is NOT
+claimed in this mode. No global firewall reset or disable is performed.
+
+Read-only diagnostics run in parallel; MSI installs and service mutations stay
+serial. MSI 1618 gets up to three attempts, reboot-needed codes are retained.
+SSH prerequisite failures are aggregated; Tailscale may complete independently,
+then SSH stops with an explicit partial result. Successful installation still
+requires final verification. Existing uncertain-operation/recovery markers remain
+blocking; automatic replay is not claimed.
+
+Windows validated ZIP build (uses PowerShell syntax, official MSI signatures and
+safe SelfTest; no IExpress or 7z needed):
+
+```bash
+./scripts/build-oneclick-windows.sh build/oneclick/private-config.json --zip
+```
+
+Portable packaging on macOS/Linux (pinned MSI files must already be present;
+this command checks hashes/public key/ZIP contents but does not replace Windows
+signature/SelfTest validation):
+
+```bash
+python3 scripts/build-portable.py build/oneclick/private-config.json --output build/dist/migration.zip
+python3 scripts/build-portable.py build/oneclick/private-config.json --scripts-only --output build/dist/migration-update.zip
+```
+
+Outputs refuse overwrite. Full ZIP has one Friend-Migration-SSH folder. Updates
+contain all scripts at root: copy ALL files into the existing launcher.cmd folder,
+retaining the two pinned MSIs. Both artifacts contain the auth key and must stay
+private. No raw private config is included.
+
+Every normal run attempts to export desktop `SSH-诊断报告.json` and
+`SSH-反馈资料.zip`. Failed runs replace connection information with explicit partial
+status. Reports contain warnings, errors, system/firewall diagnostic results and
+bounded MSI log tails. Diagnostics time out with partial evidence instead of
+blocking indefinitely. The support ZIP is local; existing event endpoints do not
+automatically upload this ZIP. Success output includes host-public-key fingerprints.
+
+Tests: `scripts/test_build_portable.py`, `scripts/test_render_setup.py`,
+`scripts/test-resilience.ps1`, `scripts/test-safety.ps1`. Current Windows mocks do
+not establish live installation/UAC/new-machine compatibility.
+
+The sections below describe the original strict-mode baseline unless overridden
+by the migration candidate behavior above.
+
 This is a personal, Windows x64-only, console installer for onboarding one
 remote machine without the Wails UI. The distributable is a single IExpress
 self-extracting executable; the recipient does not open a zip or locate a
@@ -103,6 +181,18 @@ building; this change does not alter any live endpoint or private config.
    firewall policy, and Tailnet identity/IP. Copy connection details; explicitly
    ask the controller to try a real connection. Local checks are not end-to-end
    reachability or authentication evidence.
+
+Connection details: `SSH-连接信息.txt` emits `ssh -l "<user>" <ip>` only for ASCII
+usernames. For non-ASCII usernames (for example Chinese) it emits an
+`~/.ssh/config` Host block instead, because OpenSSH rejects non-ASCII remote
+usernames on the command line. The controller must add its own `IdentityFile`;
+this is a client-side step and is not verified by the target's local checks.
+
+Scope: this builder produces Windows payloads only. The macOS onboarding kit is
+a local artifact, not generated here and not covered by CI or Windows SelfTest.
+The 1.2.1 connection-text fix has been parsed under PowerShell 7 and covered by
+the resilience fixtures; Windows PowerShell 5.1 parsing and SelfTest still need
+to be rerun before producing a new package.
 
 On an ordinary configuration failure, attempt restoration of the captured
 files/ACLs, firewall rules and service state. An interrupted or failed recovery

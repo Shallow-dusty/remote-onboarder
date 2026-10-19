@@ -5,7 +5,7 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 umask 077
 config=${1:-"$repo/build/oneclick/private-config.json"}
 mode=${2:-package}
-[[ "$mode" == package || "$mode" == --validate-only ]] || { printf 'expected --validate-only or package\n' >&2; exit 1; }
+[[ "$mode" == package || "$mode" == --validate-only || "$mode" == --zip ]] || { printf 'expected --validate-only, --zip or package\n' >&2; exit 1; }
 payload_dir="$repo/build/oneclick/payloads"
 source_dir="$repo/payload"
 
@@ -13,7 +13,10 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 command -v jq >/dev/null || fail 'jq is required'
 command -v curl >/dev/null || fail 'curl is required'
 command -v powershell.exe >/dev/null || fail 'Windows PowerShell is required (run from WSL)'
-command -v iexpress.exe >/dev/null || fail 'Windows IExpress is required (run from WSL)'
+if [[ "$mode" == package ]]; then
+  command -v iexpress.exe >/dev/null || fail 'Windows IExpress is required (run from WSL)'
+  command -v 7z >/dev/null || fail '7z is required for EXE verification; use --zip for portable distribution'
+fi
 [[ -f "$config" ]] || fail "private config not found: $config"
 
 command -v python3 >/dev/null || fail 'python3 is required'
@@ -53,7 +56,7 @@ sed_path="$stage/package.sed"
 
 powershell.exe -NoProfile -Command "Remove-Item -LiteralPath '$stage_win' -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force -Path '$stage_win' | Out-Null; Remove-Item -LiteralPath '$output_win' -Force -ErrorAction SilentlyContinue; exit 0"
 mkdir -p "$stage"
-cp "$source_dir/launcher.cmd" "$source_dir/bootstrap.ps1" "$source_dir/safety.ps1" "$stage/"
+cp "$source_dir/launcher.cmd" "$source_dir/bootstrap.ps1" "$source_dir/safety.ps1" "$source_dir/diagnostics.ps1" "$stage/"
 cp "$payload_dir/$openssh_name" "$payload_dir/$tailscale_name" "$stage/"
 
 # Remove only this invocation's unique credential-bearing staging directory.
@@ -82,12 +85,18 @@ if [[ "$mode" == --validate-only ]]; then
   exit 0
 fi
 
+if [[ "$mode" == --zip ]]; then
+  mkdir -p "$repo/build/dist"
+  python3 "$repo/scripts/build-portable.py" "$config" --payload-dir "$payload_dir" --output "$repo/build/dist/SSH-Migration-${session}.zip"
+  exit 0
+fi
+
 TARGET_NAME="$output_win" STAGE_WIN="$stage_win" SED_PATH="$sed_path" python3 - <<'PY'
 from pathlib import Path
 import os
 stage = os.environ['STAGE_WIN']
 target = os.environ['TARGET_NAME']
-files = ['launcher.cmd', 'bootstrap.ps1', 'safety.ps1', 'setup.ps1', 'OpenSSH-Win64-v10.0.0.0.msi', 'tailscale-setup-1.102.3-amd64.msi']
+files = ['launcher.cmd', 'bootstrap.ps1', 'safety.ps1', 'diagnostics.ps1', 'setup.ps1', 'OpenSSH-Win64-v10.0.0.0.msi', 'tailscale-setup-1.102.3-amd64.msi']
 strings = [
     '[Version]', 'Class=IEXPRESS', 'SEDVersion=3', '',
     '[Options]', 'PackagePurpose=InstallApp', 'ShowInstallProgramWindow=1',
@@ -120,14 +129,14 @@ inspect_dir="$stage/inspect"
 rm -rf "$inspect_dir"
 mkdir -p "$inspect_dir"
 7z x -y -o"$inspect_dir" "$output" >/dev/null
-for f in launcher.cmd bootstrap.ps1 safety.ps1 setup.ps1 "$openssh_name" "$tailscale_name"; do
+for f in launcher.cmd bootstrap.ps1 safety.ps1 diagnostics.ps1 setup.ps1 "$openssh_name" "$tailscale_name"; do
   [[ -f "$inspect_dir/$f" ]] || fail "SFX missing: $f"
   cmp "$stage/$f" "$inspect_dir/$f" || fail "SFX content mismatch: $f"
 done
 
 # Copy through Windows APIs to avoid drvfs replacement/cache surprises.
 desktop_win=$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("Desktop")' | tr -d '\r' | tail -n1)
-final_win="${desktop_win}\\SSH-Launchpad-OneClick-Windows-x64.exe"
+final_win="${desktop_win}\\SSH-Launchpad-OneClick-${session}-Windows-x64.exe"
 powershell.exe -NoProfile -Command "Copy-Item -LiteralPath '$output_win' -Destination '$final_win' -Force; Get-Item -LiteralPath '$final_win' | Select-Object FullName,Length,LastWriteTime | Format-List"
 
 printf '\nBuild complete.\nSHA-256: '
